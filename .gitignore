@@ -1,0 +1,17 @@
+# Python 캐시 및 로컬 가상환경
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+
+# IDE/운영체제별 개인 설정
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 실험 실행 중 생성되는 데이터와 그래프
+data/
+*.log
