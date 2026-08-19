@@ -1,0 +1,4 @@
+# Python 3.10 호환 버전 범위
+PyVISA>=1.13,<2.0
+pyvisa-py>=0.7,<1.0
+matplotlib>=3.7,<3.11
