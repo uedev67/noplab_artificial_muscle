@@ -85,6 +85,7 @@ class Keithley2450(SourceMeasureUnit):
         self._resource_manager: Any = None
         self._instrument: Any = None
         self._set_voltage = 0.0
+        self._source_function = "voltage"
 
     def connect(self) -> None:
         # 더미 모드에서는 PyVISA가 없어도 되도록 실장비 연결 시점에 import한다.
@@ -107,6 +108,7 @@ class Keithley2450(SourceMeasureUnit):
         self._instrument.write(':SOUR:VOLT 0')
         self._instrument.write(':SENS:FUNC "CURR"')
         self._instrument.write(f":SOUR:VOLT:ILIM {self.current_limit}")
+        self._source_function = "voltage"
 
     def _require_connection(self) -> Any:
         if self._instrument is None:
@@ -118,10 +120,56 @@ class Keithley2450(SourceMeasureUnit):
 
         return str(self._require_connection().query("*IDN?")).strip()
 
+    def configure_two_wire_resistance(
+        self, source_current: float, voltage_limit: float
+    ) -> None:
+        """전류를 소싱하고 전압을 측정하는 2선 저항 모드로 설정한다."""
+
+        if source_current <= 0.0:
+            raise ValueError("source_current는 0보다 커야 합니다.")
+        if voltage_limit <= 0.0:
+            raise ValueError("voltage_limit은 0보다 커야 합니다.")
+
+        instrument = self._require_connection()
+        instrument.write("*RST")
+        instrument.write(':SENS:FUNC "VOLT"')
+        instrument.write(":SENS:VOLT:RANG:AUTO ON")
+        instrument.write(":SENS:VOLT:RSEN OFF")
+        instrument.write(":SOUR:FUNC CURR")
+        instrument.write(":SOUR:CURR 0")
+        instrument.write(f":SOUR:CURR:VLIM {float(voltage_limit):.12g}")
+        instrument.write(f":SOUR:CURR {float(source_current):.12g}")
+        self._set_voltage = 0.0
+        self._source_function = "current"
+
+    def measure_two_wire_resistance(self, source_current: float) -> Measurement:
+        """측정 전압과 소스 전류로 2선 저항을 계산한다."""
+
+        if source_current <= 0.0:
+            raise ValueError("source_current는 0보다 커야 합니다.")
+        voltage = float(self._require_connection().query(":MEAS:VOLT?"))
+        resistance = abs(voltage / source_current)
+        return Measurement(
+            voltage=voltage,
+            current=source_current,
+            resistance=resistance,
+        )
+
     def set_voltage(self, voltage: float) -> None:
         instrument = self._require_connection()
         instrument.write(f":SOUR:VOLT {float(voltage):.12g}")
         self._set_voltage = float(voltage)
+
+    def safe_shutdown(self) -> None:
+        """현재 소스 함수의 출력을 0으로 내리고 출력을 끈다."""
+
+        try:
+            if self._instrument is not None and self._source_function == "current":
+                self._instrument.write(":SOUR:CURR 0")
+            else:
+                self.set_voltage(0.0)
+        finally:
+            self.output_off()
 
     def output_on(self) -> None:
         self._require_connection().write(":OUTP ON")
