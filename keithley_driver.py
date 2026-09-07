@@ -57,6 +57,11 @@ class SourceMeasureUnit(ABC):
         finally:
             self.output_off()
 
+    def configure_voltage_measurement(self, wire_mode: int) -> None:
+        """Configure local (2-wire) or remote (4-wire) voltage sensing."""
+        if wire_mode not in (2, 4):
+            raise ValueError("wire_mode must be 2 or 4")
+
     def __enter__(self) -> "SourceMeasureUnit":
         self.connect()
         return self
@@ -86,6 +91,7 @@ class Keithley2450(SourceMeasureUnit):
         self._instrument: Any = None
         self._set_voltage = 0.0
         self._source_function = "voltage"
+        self._reading_index = 0
 
     def connect(self) -> None:
         # 더미 모드에서는 PyVISA가 없어도 되도록 실장비 연결 시점에 import한다.
@@ -160,6 +166,17 @@ class Keithley2450(SourceMeasureUnit):
         instrument.write(f":SOUR:VOLT {float(voltage):.12g}")
         self._set_voltage = float(voltage)
 
+    def configure_voltage_measurement(self, wire_mode: int) -> None:
+        super().configure_voltage_measurement(wire_mode)
+        instrument = self._require_connection()
+        instrument.write(':SENS:CURR:RSEN ' + ('ON' if wire_mode == 4 else 'OFF'))
+        # Source readback stores the actual sourced voltage beside each current
+        # reading in defbuffer1.  READ? itself returns only the current on the
+        # 2450, so the voltage is retrieved from the matching buffer record.
+        instrument.write(":SOUR:VOLT:READ:BACK ON")
+        instrument.write(':TRAC:CLE "defbuffer1"')
+        self._reading_index = 0
+
     def safe_shutdown(self) -> None:
         """현재 소스 함수의 출력을 0으로 내리고 출력을 끈다."""
 
@@ -180,10 +197,14 @@ class Keithley2450(SourceMeasureUnit):
 
     def measure(self) -> Measurement:
         instrument = self._require_connection()
-        current = float(instrument.query(":MEAS:CURR?"))
-        # 전압 소싱 시 설정값을 기록한다. 정밀 readback이 필요하면 모델별 구현에서
-        # source readback 명령으로 이 부분을 교체할 수 있다.
-        voltage = self._set_voltage
+        current = float(instrument.query(':READ? "defbuffer1"'))
+        self._reading_index += 1
+        voltage = float(
+            instrument.query(
+                f':TRAC:DATA? {self._reading_index},{self._reading_index},'
+                '"defbuffer1",SOUR'
+            )
+        )
         resistance = abs(voltage / current) if abs(current) > 1e-15 else float("inf")
         return Measurement(voltage=voltage, current=current, resistance=resistance)
 
