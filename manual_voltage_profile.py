@@ -33,6 +33,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
+from voltage_profiles import PROFILES
+
 from keithley_driver import (
     DummySourceMeasureUnit,
     Keithley2450,
@@ -56,15 +58,15 @@ from keithley_driver import (
 # 실험 4처럼 cycle 정보를 명확하게 남기고 싶으면 extended form을 권장.
 # ---------------------------------------------------------------------------
 
-PROFILE = [
-    (0.0, 5.0),
-    (5.0, 10.0),
-    (10.0, 10.0),
-    (15.0, 10.0),
-    (20.0, 10.0),
-    (25.0, 10.0),
-    (0.0, 10.0),
-]
+# voltage_profiles.py에 저장된 프로파일 이름을 선택하세요.
+PROFILE_NAME = "default"
+
+if PROFILE_NAME not in PROFILES:
+    raise ValueError(
+        f"Unknown PROFILE_NAME: {PROFILE_NAME!r}. "
+        f"Available profiles: {', '.join(PROFILES)}"
+    )
+PROFILE = list(PROFILES[PROFILE_NAME])
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +80,15 @@ CURRENT_LIMIT = 0.15  # A
 SAMPLE_INTERVAL_S = 0.1
 
 RESOURCE_NAME = "USB0::0x05E6::0x2450::04495764::INSTR"
+
+# 아두이노 마커 시스템 스위치(False이면 아두이노 미사용)
+use_serial_marker = False
+SERIAL_MARKER_PORT = ""  # Set to the Arduino port, e.g. "COM3".
+SERIAL_MARKER_BAUDRATE = 9600  # Must match Arduino Serial.begin(...).
+SERIAL_MARKER_READY_DELAY_S = 2.0  # Allow Arduino to reboot after opening USB.
+SERIAL_MARKER_RETRY_DELAY_S = 1.0
+# For Arduino readStringUntil('\n'); change if the sketch uses another framing.
+SERIAL_MARKER_COMMAND = b"start\n"
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +336,9 @@ def infer_state(
 
 def validate_settings() -> None:
 
+    if use_serial_marker and not SERIAL_MARKER_PORT.strip():
+        raise ValueError("Set SERIAL_MARKER_PORT to the Arduino COM port")
+
     if WIRE_MODE not in (2, 4):
 
         raise ValueError(
@@ -389,6 +403,41 @@ def validate_settings() -> None:
 # =============================================================================
 
 
+def connect_serial_marker():
+    """Open the configured port, with two retries before aborting.
+
+    This checks USB serial access, not Arduino firmware readiness (which would
+    require a reply from the sketch). No start command is sent here.
+    """
+    import serial
+
+    for attempt in range(1, 4):
+        try:
+            connection = serial.Serial(
+                port=SERIAL_MARKER_PORT,
+                baudrate=SERIAL_MARKER_BAUDRATE,
+                timeout=1.0,
+                write_timeout=1.0,
+            )
+        except (serial.SerialException, OSError) as exc:
+            print(f"Arduino connection attempt {attempt}/3 failed: {exc}")
+            if attempt == 3:
+                raise RuntimeError(
+                    "Arduino connection failed after 3 attempts; experiment aborted."
+                ) from exc
+            time.sleep(SERIAL_MARKER_RETRY_DELAY_S)
+            continue
+
+        try:
+            # Opening the port may reset the Arduino; wait before the profile.
+            time.sleep(SERIAL_MARKER_READY_DELAY_S)
+            print(f"Arduino serial port connected: {SERIAL_MARKER_PORT}")
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+
 def run_profile(
     smu: SourceMeasureUnit,
     output_path: Path,
@@ -402,6 +451,8 @@ def run_profile(
     )
 
     csv_file: TextIO | None = None
+    serial_marker = None
+    marker_sent = False
 
     # -------------------------------------------------------------------------
     # Energy integration states
@@ -426,6 +477,9 @@ def run_profile(
     smu.connect()
 
     try:
+
+        if use_serial_marker:
+            serial_marker = connect_serial_marker()
 
         smu.configure_voltage_measurement(
             WIRE_MODE
@@ -590,6 +644,17 @@ def run_profile(
             smu.set_voltage(
                 set_voltage
             )
+
+            if (
+                serial_marker is not None
+                and not marker_sent
+                and set_voltage == 0.0
+                and duration_s == 5.0
+            ):
+                written = serial_marker.write(SERIAL_MARKER_COMMAND)
+                if written != len(SERIAL_MARKER_COMMAND):
+                    raise IOError("Incomplete Arduino start command")
+                marker_sent = True
 
             step_start = time.monotonic()
 
@@ -1022,7 +1087,11 @@ def run_profile(
 
             finally:
 
-                smu.close()
+                try:
+                    smu.close()
+                finally:
+                    if serial_marker is not None:
+                        serial_marker.close()
 
 
 # =============================================================================
