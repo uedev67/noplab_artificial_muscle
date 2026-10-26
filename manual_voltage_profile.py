@@ -31,6 +31,7 @@ import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event
 from typing import TextIO
 
 from voltage_profiles import PROFILES
@@ -59,7 +60,19 @@ from keithley_driver import (
 # ---------------------------------------------------------------------------
 
 # voltage_profiles.py에 저장된 프로파일 이름을 선택하세요.
-PROFILE_NAME = "default"
+# Preserve the locally customized experiment profile.
+PROFILES["local_custom"] = [
+    (0.0, 5.0), 
+    (10.0, 6.0), (0.0, 6.0),
+    (10.0, 6.0), (0.0, 6.0),
+    (10.0, 6.0), (0.0, 6.0),
+    (10.0, 6.0), (0.0, 6.0),
+    (10.0, 6.0), (0.0, 6.0),
+    (10.0, 6.0), (0.0, 6.0),
+
+    
+]
+PROFILE_NAME = "local_custom"
 
 if PROFILE_NAME not in PROFILES:
     raise ValueError(
@@ -75,15 +88,14 @@ PROFILE = list(PROFILES[PROFILE_NAME])
 
 WIRE_MODE = 4  # 2 or 4
 
-CURRENT_LIMIT = 0.15  # A
-
+CURRENT_LIMIT = 0.35  # A
 SAMPLE_INTERVAL_S = 0.1
 
 RESOURCE_NAME = "USB0::0x05E6::0x2450::04495764::INSTR"
 
 # 아두이노 마커 시스템 스위치(False이면 아두이노 미사용)
-use_serial_marker = False
-SERIAL_MARKER_PORT = ""  # Set to the Arduino port, e.g. "COM3".
+use_serial_marker = True
+SERIAL_MARKER_PORT = "COM9"  # Arduino UNO R4 WiFi; update if the assigned port changes.
 SERIAL_MARKER_BAUDRATE = 9600  # Must match Arduino Serial.begin(...).
 SERIAL_MARKER_READY_DELAY_S = 2.0  # Allow Arduino to reboot after opening USB.
 SERIAL_MARKER_RETRY_DELAY_S = 1.0
@@ -345,13 +357,13 @@ def validate_settings() -> None:
             "WIRE_MODE must be 2 or 4"
         )
 
-    if CURRENT_LIMIT <= 0:
+    if not math.isfinite(CURRENT_LIMIT) or CURRENT_LIMIT <= 0:
 
         raise ValueError(
             "CURRENT_LIMIT must be positive"
         )
 
-    if SAMPLE_INTERVAL_S <= 0:
+    if not math.isfinite(SAMPLE_INTERVAL_S) or SAMPLE_INTERVAL_S <= 0:
 
         raise ValueError(
             "SAMPLE_INTERVAL_S must be positive"
@@ -441,6 +453,8 @@ def connect_serial_marker():
 def run_profile(
     smu: SourceMeasureUnit,
     output_path: Path,
+    stop_event: Event | None = None,
+    exclusive_output: bool = False,
 ) -> None:
 
     validate_settings()
@@ -474,19 +488,23 @@ def run_profile(
     # Connect Keithley
     # -------------------------------------------------------------------------
 
-    smu.connect()
-
+    if stop_event is not None and stop_event.is_set():
+        return
     try:
+        smu.connect()
 
         if use_serial_marker:
             serial_marker = connect_serial_marker()
+
+        if stop_event is not None and stop_event.is_set():
+            return
 
         smu.configure_voltage_measurement(
             WIRE_MODE
         )
 
         csv_file = output_path.open(
-            "w",
+            "x" if exclusive_output else "w",
             newline="",
             encoding="utf-8-sig",
         )
@@ -587,6 +605,8 @@ def run_profile(
             PROFILE,
             start=1,
         ):
+            if stop_event is not None and stop_event.is_set():
+                return
 
             (
                 set_voltage,
@@ -648,13 +668,18 @@ def run_profile(
             if (
                 serial_marker is not None
                 and not marker_sent
-                and set_voltage == 0.0
-                and duration_s == 5.0
             ):
+                # Mark the first profile voltage command, including 0 V.
                 written = serial_marker.write(SERIAL_MARKER_COMMAND)
                 if written != len(SERIAL_MARKER_COMMAND):
                     raise IOError("Incomplete Arduino start command")
+                serial_marker.flush()
                 marker_sent = True
+                print(
+                    f"Arduino marker TX: {SERIAL_MARKER_COMMAND!r} "
+                    f"on {SERIAL_MARKER_PORT}, step {step_index}, "
+                    f"t={time.monotonic() - experiment_start:.3f} s"
+                )
 
             step_start = time.monotonic()
 
@@ -675,6 +700,8 @@ def run_profile(
             # =================================================================
 
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    return
 
                 loop_start = time.monotonic()
 
@@ -1051,10 +1078,10 @@ def run_profile(
                 )
 
                 if sleep_s > 0:
-
-                    time.sleep(
-                        sleep_s
-                    )
+                    if stop_event is None:
+                        time.sleep(sleep_s)
+                    elif stop_event.wait(sleep_s):
+                        return
 
 
             previous_set_voltage = (
