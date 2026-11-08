@@ -606,7 +606,15 @@ def validate_settings() -> None:
 
     probe = normalize_probe(PROBE)
 
-    if probe is not None and probe["enabled"]:
+    # R_ref steps source the probe current even when PROBE["enabled"] is False.
+    has_rref_step = any(
+        len(entry) == 5
+        and isinstance(entry[4], dict)
+        and entry[4].get("kind") == "rref"
+        for entry in PROFILE
+    )
+
+    if probe is not None and (probe["enabled"] or has_rref_step):
 
         if SAFETY_LIMITS is None:
 

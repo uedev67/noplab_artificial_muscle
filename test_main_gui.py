@@ -336,6 +336,222 @@ class GUIIntegrationTests(unittest.TestCase):
         self.assertFalse(other.dirty)
 
 
+class GUICoolingTests(unittest.TestCase):
+    """GUI: probe panel, step end options, R_ref step, block / sweep dialogs."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.profile_dir = Path(self.temp.name) / "profiles"
+        self.gui = main_gui.ExperimentGUI(
+            self.root, profile_dir=self.profile_dir,
+            settings_path=Path(self.temp.name) / "settings" / "last_settings.json")
+        self.gui.clear_rows()
+        with patch.object(self.gui, "ask_mode_change", return_value="clear"):
+            self.gui.set_mode("power")
+        for key, value in {"sample": "7", "cycle": "1", "directory": self.temp.name,
+                           "SAMPLE_INTERVAL_S": "0.01"}.items():
+            self.gui.variables[key].set(value)
+        self.gui.dummy.set(True)
+
+    def tearDown(self):
+        for after_id in self.root.tk.splitlist(self.root.tk.call("after", "info")):
+            self.root.tk.call("after", "cancel", after_id)
+        self.root.destroy()
+        self.temp.cleanup()
+
+    def table(self):
+        return [[v.get() for v in variables] + [widgets[3].cget("text")]
+                for variables, widgets in self.gui.rows]
+
+    def conditional_row(self, kind="rref"):
+        item = self.gui.add_row(0, 15, "cool")
+        dialog = self.gui.open_step_options(item)
+        dialog.form.kind.set(kind)
+        dialog.form.refresh()
+        dialog.form.vars["t_max_s"].set("40")
+        self.assertTrue(dialog.ok())
+        return item
+
+    def test_step_end_options_probe_panel_and_profile_round_trip(self):
+        gui = self.gui
+        gui.probe_enabled.set(True)
+        gui.probe_vars["I_probe_A"].set("1")
+        gui.r_ref_manual.set("29.5")
+        gui.timeout_abort.set(True)
+        gui.timeout_count.set("3")
+        gui.add_row(0, 5, "idle")
+        gui.add_row(0.3, 8, "heat")
+        self.conditional_row("rref")
+        rref_item = gui.insert_rref_step({"t_on_s": 5, "t_off_s": 5, "repeats": 3})
+        self.assertIs(gui.rows[1], rref_item)                      # after the idle row
+        self.assertEqual(self.table(), [
+            ["0", "5", "idle", "고정"], ["0", "30", "R_ref measure", "R_ref 측정"],
+            ["0.3", "8", "heat", "고정"], ["0", "40", "cool", "조건·R_ref"]])
+        with patch.object(gui, "ask_profile_name", return_value="냉각 조건"):
+            self.assertTrue(gui.save_profile_as())
+        saved = json.loads((self.profile_dir / "냉각 조건.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["format_version"], 2)
+        self.assertEqual(saved["steps"][1]["kind"], "rref")
+        self.assertEqual(saved["steps"][3]["end"], {"type": "rref", "t_min_s": 10.0,
+                                                    "tol_pct": 0.5, "k_samples": 5})
+        self.assertEqual(saved["steps"][3]["duration_s"], 40.0)
+        self.assertNotIn("end", saved["steps"][2])
+        self.assertEqual(saved["probe"]["enabled"], True)
+        self.assertEqual(saved["probe"]["I_probe_A"], 0.001)
+        self.assertEqual(saved["R_ref"], {"manual_ohm": 29.5})
+        self.assertEqual(saved["cooling"], {"timeout_abort": True, "timeout_abort_count": 3})
+
+        # Change everything, then load it back.
+        gui.clear_rows()
+        gui.probe_enabled.set(False)
+        gui.r_ref_manual.set("")
+        gui.timeout_abort.set(False)
+        summary = next(s for s in profile_store.list_profiles(self.profile_dir)[0]
+                       if s["name"] == "냉각 조건")
+        self.assertEqual((summary["total_min_s"], summary["total_s"]), (53.0, 83.0))
+        with patch("main_gui.messagebox.askyesno", return_value=True):
+            self.assertTrue(gui.load_profile_summary(summary))
+        self.assertEqual(self.table()[1][3], "R_ref 측정")
+        self.assertEqual(self.table()[3][3], "조건·R_ref")
+        self.assertTrue(gui.probe_enabled.get())
+        self.assertEqual(gui.r_ref_manual.get(), "29.5")
+        self.assertTrue(gui.timeout_abort.get())
+        self.assertEqual(gui.timeout_count.get(), "3")
+        self.assertFalse(gui.dirty)
+
+    def test_version_1_profile_loads_in_gui_with_probe_off(self):
+        self.profile_dir.mkdir(parents=True)
+        (self.profile_dir / "옛 형식.json").write_text(
+            json.dumps(ProfileStoreTests.V1_PROFILE, ensure_ascii=False), encoding="utf-8")
+        self.gui.probe_enabled.set(True)
+        summary = next(s for s in profile_store.list_profiles(self.profile_dir)[0]
+                       if s["name"] == "옛 형식")
+        with patch("main_gui.messagebox.askyesno", return_value=True):
+            self.assertTrue(self.gui.load_profile_summary(summary))
+        self.assertFalse(self.gui.probe_enabled.get())
+        self.assertEqual(self.table(), [["0", "5", "초기", "고정"], ["0.5", "10", "가열", "고정"]])
+
+    def test_conditional_end_needs_probe_and_zero_value(self):
+        gui = self.gui
+        zero = gui.add_row(0, 15)
+        heat = gui.add_row(0.3, 8)
+        dialog = gui.open_step_options(zero)
+        self.assertTrue(dialog.form.radios["rref"].instate(["disabled"]))   # probe off
+        self.assertFalse(dialog.form.radios["rref_step"].instate(["disabled"]))
+        dialog.window.destroy()
+        gui.probe_enabled.set(True)
+        dialog = gui.open_step_options(heat)
+        self.assertTrue(dialog.form.radios["slope"].instate(["disabled"]))  # value != 0
+        dialog.window.destroy()
+        dialog = gui.open_step_options(zero)
+        self.assertFalse(dialog.form.radios["slope"].instate(["disabled"]))
+        dialog.window.destroy()
+
+        # A conditional row is refused at start once the probe is switched off.
+        self.conditional_row("slope")
+        gui.probe_enabled.set(False)
+        with patch("main_gui.messagebox.showerror") as error:
+            gui.start()
+        self.assertFalse(gui.running)
+        self.assertIn("측정 전류가 켜져", error.call_args[0][1])
+        # R_ref-return condition without any R_ref.
+        gui.probe_enabled.set(True)
+        self.conditional_row("rref")
+        with patch("main_gui.messagebox.showerror") as error:
+            gui.start()
+        self.assertIn("R_ref가 없습니다", error.call_args[0][1])
+
+    def test_block_dialog_adds_rows(self):
+        gui = self.gui
+        gui.add_row(0, 5, "idle")
+        dialog = gui.open_block_dialog()
+        dialog.vars["value"].set("0.5")
+        dialog.vars["heat_s"].set("8")
+        dialog.vars["repeats"].set("2")
+        dialog.cooling.vars["duration_s"].set("15")
+        self.assertTrue(dialog.ok())
+        self.assertEqual(self.table(), [
+            ["0", "5", "idle", "고정"],
+            ["0.5", "8", "0.5W #1 heat", "고정"], ["0", "15", "0.5W #1 cool", "고정"],
+            ["0.5", "8", "0.5W #2 heat", "고정"], ["0", "15", "0.5W #2 cool", "고정"]])
+        dialog = gui.open_block_dialog()
+        self.assertTrue(dialog.cooling.radios["rref"].instate(["disabled"]))  # probe off
+        dialog.window.destroy()
+
+    def test_sweep_dialog_preview_apply_and_limit_refusal(self):
+        gui = self.gui
+        gui.probe_enabled.set(True)
+        gui.limit_vars["power"]["P_max"].set("1.1")
+        gui.add_row(1, 1, "will be replaced")
+        dialog = gui.open_sweep_dialog()
+        for key, value in {"ref_value": "0.3", "start": "0.4", "end": "0.7", "step": "0.1",
+                           "heat_s": "8", "idle_s": "5"}.items():
+            dialog.vars[key].set(value)
+        dialog.value_source.set("range")
+        dialog.include_rref.set(True)
+        dialog.cooling.kind.set("rref")
+        dialog.show_preview()
+        preview = dialog.preview.get()
+        self.assertIn("총 38단계 · 가열 사이클 18회", preview)
+        self.assertIn(main_gui.format_duration(5 + 30 + 18 * 18), preview)
+        self.assertIn(main_gui.format_duration(5 + 30 + 18 * 48), preview)
+        self.assertIn("최대값: 0.7 W", preview)
+        self.assertIn("안전 상한 이하", preview)
+        with patch("main_gui.messagebox.askyesno", return_value=True) as ask:
+            self.assertTrue(dialog.apply())
+        self.assertIn("지우고", ask.call_args[0][1])
+        table = self.table()
+        self.assertEqual(len(table), 38)
+        self.assertEqual(table[0], ["0", "5", "idle", "고정"])
+        self.assertEqual(table[1][2:], ["R_ref measure", "R_ref 측정"])
+        self.assertEqual(table[2], ["0.3", "8", "ref 0.3W #1 heat", "고정"])
+        self.assertEqual(table[3], ["0", "40", "ref 0.3W #1 cool", "조건·R_ref"])
+        self.assertEqual(table[6][2], "test 0.4W #1 heat")
+
+        # Over the limit: preview warns, apply is refused, table unchanged.
+        gui.limit_vars["power"]["P_max"].set("0.6")
+        dialog = gui.open_sweep_dialog()
+        for key, value in {"ref_value": "0.3", "values": "0.5, 0.7", "heat_s": "8"}.items():
+            dialog.vars[key].set(value)
+        dialog.cooling.vars["duration_s"].set("15")
+        with patch("main_gui.messagebox.showerror") as error, \
+                patch("main_gui.messagebox.askyesno") as ask:
+            self.assertFalse(dialog.apply())
+        ask.assert_not_called()
+        self.assertIn("안전 상한 초과", error.call_args[0][1])
+        self.assertEqual(len(self.table()), 38)
+
+    def test_gui_run_with_probe_and_rref_step(self):
+        gui = self.gui
+        gui.probe_enabled.set(True)
+        gui.r_ref_manual.set("")
+        gui.insert_rref_step({"t_on_s": 0.2, "t_off_s": 0.1, "repeats": 1})
+        gui.add_row(0.1, 0.2, "heat")
+        item = gui.add_row(0, 1, "cool")
+        gui.set_row_options(item, {"type": "rref", "t_max_s": 1.0, "t_min_s": 0.05,
+                                   "tol_pct": 5.0, "k_samples": 3})
+        settings, path, dummy = gui.collect_settings()
+        self.assertEqual(settings["PROBE"]["enabled"], True)
+        self.assertEqual(settings["PROFILE"][0][4]["kind"], "rref")
+        self.assertIsNone(settings["MANUAL_R_REF"])
+        self.assertIsNone(settings["COOLING_TIMEOUT_ABORT"])
+        gui.worker(settings, path, dummy)
+        self.assertIsNone(recorder.PROBE)                            # CLI defaults restored
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual({r["phase"] for r in rows}, {"rref", "heating", "cooling"})
+        r_ref = float(rows[-1]["R_ref_ohm"])
+        self.assertAlmostEqual(r_ref, 100.0, delta=2.0)
+        self.assertEqual(rows[-1]["cooling_end_reason"], "condition")
+        gui.set_running(True)
+        gui.poll()
+        self.assertIn(f"{r_ref:.6g} Ω (측정값", gui.r_ref_status.get())
+        self.assertIn("R_ref", gui.status.get())
+        self.assertFalse(gui.running)
+
+
 LEGACY_FIELDNAMES = [
     "experiment_id", "sample_id", "operator", "sample_index",
     "timestamp_local", "timestamp_utc", "time_s", "dt_s", "measurement_duration_s",
@@ -851,7 +1067,9 @@ class RrefStepTests(RecorderTestBase):
         for profile, probe, message in (
                 ([self.rref_step()], None, "측정 전류 설정이 필요"),
                 ([(0.0, 5.0, 1, "", {"kind": "rref", "rref": self.SPEC})], PROBE, "≠"),
-                ([(1.0, 1.2, 1, "", {"kind": "rref", "rref": self.SPEC})], PROBE, "값은 0")):
+                ([(1.0, 1.2, 1, "", {"kind": "rref", "rref": self.SPEC})], PROBE, "값은 0"),
+                # Probe limits are checked for an R_ref step even with the probe off.
+                ([self.rref_step()], dict(PROBE, enabled=False, I_probe_A=0.2), "I_lim")):
             with self.subTest(message=message), patch.multiple(
                     recorder, CONTROL_MODE="voltage", PROFILE=profile,
                     SAFETY_LIMITS=VOLTAGE_LIMITS, PROBE=probe, MANUAL_R_REF=None,
