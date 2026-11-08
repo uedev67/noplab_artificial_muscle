@@ -35,6 +35,7 @@ import csv
 import json
 import math
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
@@ -45,10 +46,14 @@ from voltage_profiles import PROFILES
 from control_modes import (
     MODES,
     PowerController,
+    ProbeController,
     SafetyAbort,
     SafetyMonitor,
+    normalize_probe,
     profile_violations,
+    resistance_is_valid,
     validate_limits,
+    validate_probe,
 )
 from keithley_driver import (
     DummySourceMeasureUnit,
@@ -132,6 +137,21 @@ CONTROL_MODE = "voltage"
 VOLTAGE_LIMIT = 12.0  # V, compliance used in current mode
 
 SAFETY_LIMITS = None
+
+# ---------------------------------------------------------------------------
+# Probe current in 0-output steps (냉각 중 측정 전류)
+#
+# PROBE = None keeps the original behaviour (0 V / 0 A in every 0 step).
+# With {"enabled": True, ...} every 0-value step sources a small measurement
+# current instead of 0 so R is recorded while the sample cools:
+#   voltage / power mode: V = I_probe * R_latest, clamped at V_probe_max
+#   current mode        : I_probe
+#   PROBE = {"enabled": True, "I_probe_A": 0.001, "V_probe_max_V": 0.2,
+#            "R_jump_skip_samples": 2}
+# Requires SAFETY_LIMITS.
+# ---------------------------------------------------------------------------
+
+PROBE = None
 
 # 아두이노 마커 시스템 스위치(False이면 아두이노 미사용)
 use_serial_marker = True
@@ -317,7 +337,28 @@ FIELDNAMES = [
     "limit_settings",
 
     "abort_reason",
+
+    # -------------------------------------------------------------------------
+    # Probe current / conditional cooling / R_ref (appended)
+    # -------------------------------------------------------------------------
+
+    "phase",                      # heating / cooling / rref / idle
+
+    "cycle_number",               # +1 whenever heating starts
+
+    "probe_active",               # 1 while the probe current is sourced
+
+    "R_ref_ohm",
+
+    "R_cold_before_heating_ohm",  # mean R of the last 1 s before heating
+
+    "cooling_end_reason",         # fixed / condition / timeout (last row)
+
+    "cooling_duration_s",
 ]
+
+# Window (s) of the cold-resistance average written on heating rows.
+R_COLD_WINDOW_S = 1.0
 
 
 # =============================================================================
@@ -528,6 +569,22 @@ def validate_settings() -> None:
                 "PROFILE exceeds safety limits:\n" + "\n".join(violations)
             )
 
+    probe = normalize_probe(PROBE)
+
+    if probe is not None and probe["enabled"]:
+
+        if SAFETY_LIMITS is None:
+
+            raise ValueError("PROBE requires SAFETY_LIMITS")
+
+        validate_probe(
+            CONTROL_MODE,
+            probe,
+            SAFETY_LIMITS,
+            current_limit=CURRENT_LIMIT,
+            voltage_limit=VOLTAGE_LIMIT,
+        )
+
 
 # =============================================================================
 # MAIN EXPERIMENT
@@ -567,6 +624,19 @@ def connect_serial_marker():
             connection.close()
             raise
         return connection
+
+
+def _recent_mean(samples, window_s: float) -> float | str:
+    """Mean R of (time, R) samples within *window_s* of the last one ("" if none)."""
+
+    if not samples:
+        return ""
+
+    last_time = samples[-1][0]
+
+    values = [r for t, r in samples if t >= last_time - window_s]
+
+    return sum(values) / len(values)
 
 
 def _emergency_output_off(smu: SourceMeasureUnit) -> str:
@@ -634,8 +704,28 @@ def run_profile(
         else {"I_lim": CURRENT_LIMIT}
     )
 
+    probe = normalize_probe(PROBE)
+
+    probe_enabled = probe is not None and probe["enabled"]
+
+    voltage_source = mode != "current"
+
+    probe_controller = (
+        ProbeController(probe["I_probe_A"], probe["V_probe_max_V"])
+        if probe is not None
+        else None
+    )
+
+    # R-jump check exclusion after a measurement-current regime change.
+    jump_skip_samples = probe["R_jump_skip_samples"] if probe_enabled else 0
+
+    extra_settings = {}
+
+    if probe_enabled:
+        extra_settings["probe"] = probe
+
     limit_settings = json.dumps(
-        {"mode": mode, **hardware_limit, **(SAFETY_LIMITS or {})},
+        {"mode": mode, **hardware_limit, **(SAFETY_LIMITS or {}), **extra_settings},
         ensure_ascii=False,
         sort_keys=True,
     )
@@ -658,6 +748,17 @@ def run_profile(
     previous_set_value: float | None = None
 
     sample_index = 0
+
+    # Phase / cycle / probe bookkeeping
+    seen_heating = False
+    previous_was_heating = False
+    previous_regime: str | None = None
+    cycle_number = 0
+    last_valid_resistance: float | None = None
+    # (time, R) of valid samples since the last heating -> R_cold_before_heating
+    cold_samples: deque = deque()
+    r_cold_before_heating: float | str = ""
+    r_ref_value: float | None = None
 
 
     # -------------------------------------------------------------------------
@@ -747,6 +848,12 @@ def run_profile(
             f"{SAMPLE_INTERVAL_S:.6g} s"
         )
 
+        if probe_enabled:
+            print(
+                f"Probe current : {probe['I_probe_A'] * 1e3:.6g} mA in 0 steps "
+                f"(V_probe_max {probe['V_probe_max_V']:.6g} V)"
+            )
+
         print(f"Output CSV    : {output_path}")
 
         print()
@@ -790,6 +897,58 @@ def run_profile(
             )
 
 
+            # Measurement regime of this step:
+            #   heat  : value != 0 (heating / driving output)
+            #   probe : value == 0 with the probe current
+            #   zero  : value == 0, true 0 output (original behaviour)
+            if set_value != 0.0:
+                regime = "heat"
+            elif probe_enabled:
+                regime = "probe"
+            else:
+                regime = "zero"
+
+            if regime == "heat":
+                phase = "heating"
+            elif seen_heating:
+                phase = "cooling"
+            else:
+                phase = "idle"
+
+            if regime == "heat":
+
+                if not previous_was_heating:
+
+                    cycle_number += 1
+
+                    r_cold_before_heating = _recent_mean(
+                        cold_samples, R_COLD_WINDOW_S
+                    )
+
+                seen_heating = True
+
+            elif previous_was_heating:
+
+                cold_samples.clear()
+
+            previous_was_heating = regime == "heat"
+
+            if (
+                monitor is not None
+                and jump_skip_samples
+                and previous_regime is not None
+                and regime != previous_regime
+            ):
+                # Auto range may switch between heating and probe current.
+                monitor.skip_jump_check(jump_skip_samples)
+
+            previous_regime = regime
+
+            probe_v_max = (
+                probe["V_probe_max_V"] if regime == "probe" else None
+            )
+
+
             print(f"Step {step_index}/{len(PROFILE)}")
 
             if mode == "voltage":
@@ -815,7 +974,34 @@ def run_profile(
 
             command_voltage: float | None
 
-            if mode == "voltage":
+            if regime == "probe":
+
+                if voltage_source:
+
+                    if power_controller is not None:
+                        power_controller.start_step(0.0, keep_resistance=True)
+
+                    command_voltage = probe_controller.start(last_valid_resistance)
+                    smu.set_voltage(command_voltage)
+
+                    if power_controller is not None:
+                        power_controller.command = command_voltage
+
+                    print(
+                        f"  probe    : V = I_probe x R -> "
+                        f"{command_voltage:.4g} V"
+                    )
+
+                else:
+
+                    command_voltage = None
+                    smu.set_current(probe["I_probe_A"])
+
+                    print(
+                        f"  probe    : {probe['I_probe_A'] * 1e3:.4g} mA"
+                    )
+
+            elif mode == "voltage":
 
                 command_voltage = set_value
                 smu.set_voltage(set_value)
@@ -882,16 +1068,9 @@ def run_profile(
 
                 loop_start = time.monotonic()
 
-                step_elapsed = (
-                    loop_start - step_start
-                )
-
-                if (
-                    step_previous_time is not None
-                    and step_elapsed >= duration_s
-                ):
-
-                    break
+                # The step ends after the sample that is decided to be its
+                # last one (see "Step end decision" below), so the last row
+                # of every step can carry the end reason.
 
 
                 # -------------------------------------------------------------
@@ -916,14 +1095,55 @@ def run_profile(
                         set_value,
                         command_voltage,
                         measured,
+                        probe_v_max,
                     )
 
                 next_command = command_voltage
 
-                if not abort_reason and power_controller is not None:
-                    next_command, abort_reason = power_controller.update(
-                        measured
-                    )
+                if not abort_reason:
+
+                    if regime == "probe":
+
+                        if voltage_source:
+                            next_command = probe_controller.update(measured)
+
+                            if power_controller is not None:
+                                power_controller.observe(
+                                    measured, command_voltage
+                                )
+
+                    elif power_controller is not None:
+                        next_command, abort_reason = power_controller.update(
+                            measured
+                        )
+
+                r_valid = resistance_is_valid(measured)
+
+                if r_valid:
+                    last_valid_resistance = measured.resistance
+
+                    if regime != "heat":
+                        cold_samples.append((measure_end, measured.resistance))
+
+
+                # -------------------------------------------------------------
+                # Step end decision
+                # -------------------------------------------------------------
+
+                cooling_end_reason = ""
+
+                cooling_duration: float | str = ""
+
+                next_sample_start = max(
+                    loop_start + SAMPLE_INTERVAL_S,
+                    time.monotonic(),
+                )
+
+                last_sample = next_sample_start >= step_start + duration_s
+
+                if last_sample and phase in ("cooling", "idle"):
+                    cooling_end_reason = "fixed"
+                    cooling_duration = duration_s
 
                 if abort_reason:
                     communication_error = _emergency_output_off(smu)
@@ -1156,6 +1376,19 @@ def run_profile(
                         ),
                         "limit_settings": limit_settings,
                         "abort_reason": abort_reason,
+
+                        # probe / cooling / R_ref
+                        "phase": phase,
+                        "cycle_number": cycle_number,
+                        "probe_active": int(regime == "probe"),
+                        "R_ref_ohm": (
+                            "" if r_ref_value is None else r_ref_value
+                        ),
+                        "R_cold_before_heating_ohm": (
+                            r_cold_before_heating if regime == "heat" else ""
+                        ),
+                        "cooling_end_reason": cooling_end_reason,
+                        "cooling_duration_s": cooling_duration,
                     }
                 )
 
@@ -1167,7 +1400,13 @@ def run_profile(
                 # Terminal output
                 # -------------------------------------------------------------
 
-                if mode == "voltage":
+                if regime == "probe":
+                    setpoint = (
+                        f"probe Vcmd={command_voltage:8.4f} V | "
+                        if voltage_source
+                        else f"probe Iset={probe['I_probe_A'] * 1e3:8.3f} mA | "
+                    )
+                elif mode == "voltage":
                     setpoint = f"Vset={set_value:8.4f} V | "
                 elif mode == "power":
                     setpoint = (
@@ -1220,10 +1459,10 @@ def run_profile(
 
 
                 # -------------------------------------------------------------
-                # Power mode: apply the next command voltage
+                # Power mode / probe: apply the next command voltage
                 # -------------------------------------------------------------
 
-                if power_controller is not None:
+                if power_controller is not None and regime == "heat":
 
                     if power_controller.saturated and not saturation_warned:
                         print(
@@ -1232,9 +1471,12 @@ def run_profile(
                         )
                         saturation_warned = True
 
-                    if next_command != command_voltage:
-                        smu.set_voltage(next_command)
-                        command_voltage = next_command
+                if (
+                    command_voltage is not None
+                    and next_command != command_voltage
+                ):
+                    smu.set_voltage(next_command)
+                    command_voltage = next_command
 
 
                 # -------------------------------------------------------------
@@ -1252,32 +1494,23 @@ def run_profile(
                 # Sampling timing control
                 # -------------------------------------------------------------
 
-                elapsed_this_loop = (
-                    time.monotonic()
-                    - loop_start
-                )
+                if last_sample:
 
-                desired_sleep = (
-                    SAMPLE_INTERVAL_S
-                    - elapsed_this_loop
-                )
+                    # Fixed duration: hold the output until the step ends.
+                    sleep_s = step_start + duration_s - time.monotonic()
 
-                remaining_step_time = (
-                    step_start
-                    + duration_s
-                    - time.monotonic()
-                )
+                else:
 
-                sleep_s = min(
-                    desired_sleep,
-                    remaining_step_time,
-                )
+                    sleep_s = SAMPLE_INTERVAL_S - (time.monotonic() - loop_start)
 
                 if sleep_s > 0:
                     if stop_event is None:
                         time.sleep(sleep_s)
                     elif stop_event.wait(sleep_s):
                         return
+
+                if last_sample:
+                    break
 
 
             previous_set_value = (

@@ -3,6 +3,7 @@
 import csv
 import io
 import json
+import math
 import tempfile
 import threading
 import time
@@ -351,8 +352,8 @@ VOLTAGE_LIMITS = {"V_max": 12.0, "P_max": 1.5, "R_jump_pct": 5.0}
 CURRENT_LIMITS = {"I_max": 0.16, "P_max": 1.5, "R_jump_pct": 5.0}
 
 
-class ControlModeRecorderTests(unittest.TestCase):
-    """run_profile() in each control mode with the dummy SMU (no hardware)."""
+class RecorderTestBase(unittest.TestCase):
+    """Runs run_profile() with the dummy SMU (no hardware)."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -360,13 +361,14 @@ class ControlModeRecorderTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_mode(self, mode, profile, limits, smu=None, name="run.csv"):
+    def run_mode(self, mode, profile, limits, smu=None, name="run.csv", **settings):
         smu = smu or recorder.DummySourceMeasureUnit(current_limit=0.16)
         path = Path(self.temp.name) / name
+        settings.setdefault("PROBE", None)
         with patch.multiple(recorder, CONTROL_MODE=mode, PROFILE=profile,
                             SAFETY_LIMITS=limits, use_serial_marker=False,
                             SAMPLE_INTERVAL_S=0.02, CURRENT_LIMIT=0.16,
-                            VOLTAGE_LIMIT=12.0), \
+                            VOLTAGE_LIMIT=12.0, **settings), \
                 redirect_stdout(io.StringIO()):
             try:
                 recorder.run_profile(smu, path)
@@ -379,11 +381,17 @@ class ControlModeRecorderTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
         return smu, rows, error
 
+
+class ControlModeRecorderTests(RecorderTestBase):
+    """run_profile() in each control mode with the dummy SMU (no hardware)."""
+
     def test_legacy_columns_keep_order_and_new_columns_are_appended(self):
         self.assertEqual(recorder.FIELDNAMES[:len(LEGACY_FIELDNAMES)], LEGACY_FIELDNAMES)
         self.assertEqual(recorder.FIELDNAMES[len(LEGACY_FIELDNAMES):], [
             "control_mode", "set_value", "set_unit", "set_current_A",
-            "target_power_W", "command_voltage_V", "limit_settings", "abort_reason"])
+            "target_power_W", "command_voltage_V", "limit_settings", "abort_reason",
+            "phase", "cycle_number", "probe_active", "R_ref_ohm",
+            "R_cold_before_heating_ohm", "cooling_end_reason", "cooling_duration_s"])
 
     def test_voltage_mode_legacy_values(self):
         smu, rows, error = self.run_mode("voltage", [(2.0, 0.1)], None)
@@ -523,6 +531,151 @@ class ControlModeRecorderTests(unittest.TestCase):
         self.assertEqual(recorder.infer_state(0.5, 0.3), "cooling")
         self.assertEqual(recorder.infer_state(0.3, 0.3), "hold")
         self.assertEqual(recorder.infer_state(0.0, 0.0), "off_hold")
+
+
+PROBE = {"enabled": True, "I_probe_A": 0.001, "V_probe_max_V": 0.2,
+         "R_jump_skip_samples": 2}
+
+
+def step_rows(rows, step):
+    return [r for r in rows if r["step_index"] == str(step)]
+
+
+class ProbeCurrentTests(RecorderTestBase):
+    """Probe current in 0-output steps (냉각 중 측정 전류)."""
+
+    HEAT = {"voltage": (2.0, VOLTAGE_LIMITS), "current": (0.05, CURRENT_LIMITS),
+            "power": (0.3, POWER_LIMITS)}
+
+    def test_cooling_resistance_recorded_in_every_mode(self):
+        for mode, (heat, limits) in self.HEAT.items():
+            smu = recorder.DummySourceMeasureUnit(base_resistance=30.0, current_limit=0.16)
+            with self.subTest(mode=mode):
+                smu, rows, error = self.run_mode(
+                    mode, [(0.0, 0.3), (heat, 0.4), (0.0, 0.6)], limits, smu=smu,
+                    name=f"probe_{mode}.csv", PROBE=PROBE)
+                self.assertIsNone(error)
+                self.assertEqual([r["phase"] for r in rows],
+                                 [{1: "idle", 2: "heating", 3: "cooling"}[int(r["step_index"])]
+                                  for r in rows])
+                self.assertEqual({r["cycle_number"] for r in step_rows(rows, 1)}, {"0"})
+                self.assertEqual({r["cycle_number"] for r in rows[len(step_rows(rows, 1)):]},
+                                 {"1"})
+                for step in (1, 3):
+                    zero = step_rows(rows, step)
+                    self.assertGreater(len(zero), 5)
+                    for row in zero:
+                        self.assertEqual(row["probe_active"], "1")
+                        self.assertEqual(float(row["set_value"]), 0.0)
+                        self.assertTrue(math.isfinite(float(row["resistance_ohm"])))
+                        self.assertGreater(float(row["resistance_ohm"]), 25.0)
+                        if mode != "current":
+                            self.assertLessEqual(float(row["command_voltage_V"]), 0.2)
+                    for row in zero[1:]:   # first idle sample starts from V_probe_max/4
+                        self.assertAlmostEqual(float(row["current_A"]), 0.001, delta=0.0002)
+                    self.assertEqual([r["cooling_end_reason"] for r in zero],
+                                     [""] * (len(zero) - 1) + ["fixed"])
+                    self.assertEqual(float(zero[-1]["cooling_duration_s"]),
+                                     float(zero[-1]["step_duration_s"]))
+                heating = step_rows(rows, 2)
+                self.assertTrue(all(r["probe_active"] == "0" for r in heating))
+                self.assertAlmostEqual(float(heating[0]["R_cold_before_heating_ohm"]), 30.0,
+                                       delta=0.5)
+                self.assertEqual(step_rows(rows, 1)[0]["R_cold_before_heating_ohm"], "")
+                self.assertFalse(smu._output_enabled)
+                self.assertEqual((smu._voltage, smu._current), (0, 0))
+
+    def test_probe_off_keeps_zero_output(self):
+        smu, rows, error = self.run_mode("voltage", [(0.0, 0.1), (1.0, 0.1), (0.0, 0.1)],
+                                         VOLTAGE_LIMITS)
+        self.assertIsNone(error)
+        self.assertEqual({r["probe_active"] for r in rows}, {"0"})
+        self.assertEqual({float(r["set_voltage_V"]) for r in rows if r["step_index"] != "2"},
+                         {0.0})
+
+    def test_power_mode_first_heating_uses_cold_resistance(self):
+        smu = recorder.DummySourceMeasureUnit(base_resistance=30.0, current_limit=0.16,
+                                              noise_ratio=0.0, time_constant_s=0.05)
+        limits = dict(POWER_LIMITS, max_step_V=20.0)
+        smu, rows, error = self.run_mode(
+            "power", [(0.0, 0.3), (0.3, 0.5), (0.0, 0.5), (0.3, 0.3)], limits, smu=smu,
+            PROBE=PROBE)
+        self.assertIsNone(error)
+        for heat_step in (2, 4):
+            last_probe = step_rows(rows, heat_step - 1)[-1]
+            first_heat = step_rows(rows, heat_step)[0]
+            cold_r = float(last_probe["resistance_ohm"])
+            self.assertAlmostEqual(cold_r, 30.0, delta=0.5)        # cooled down
+            command = float(first_heat["command_voltage_V"])
+            self.assertNotEqual(command, 0.1)                      # no 0.1 V re-probe
+            self.assertAlmostEqual(command, math.sqrt(0.3 * cold_r), delta=0.02)
+
+    def test_jump_check_skipped_only_right_after_regime_change(self):
+        def glitching_smu(glitch_samples, extra=None):
+            """R reads 30 % high on the given probe samples after heating."""
+            smu = recorder.DummySourceMeasureUnit(base_resistance=30.0, current_limit=0.16,
+                                                  noise_ratio=0.0)
+            measure = smu.measure
+            state = {"probe_count": 0}
+
+            def measure_with_glitch():
+                m = measure()
+                if smu._voltage > 0.2:
+                    state["probe_count"] = 0
+                    return m
+                state["probe_count"] += 1
+                if extra is not None and state["probe_count"] == 1:
+                    return extra(m)
+                if state["probe_count"] in glitch_samples:
+                    return driver.Measurement(m.voltage * 1.3, m.current, m.resistance * 1.3)
+                return m
+            smu.measure = measure_with_glitch
+            return smu
+
+        profile = [(2.0, 0.3), (0.0, 0.5)]
+        # Glitch on the 2 excluded samples right after heating -> no abort.
+        smu, rows, error = self.run_mode("voltage", profile, VOLTAGE_LIMITS,
+                                         smu=glitching_smu({1, 2}), PROBE=PROBE)
+        self.assertIsNone(error)
+        self.assertGreater(float(step_rows(rows, 2)[0]["resistance_ohm"]), 30 * 1.25)
+        # The same glitch later in the step is still a safety abort.
+        smu, rows, error = self.run_mode("voltage", profile, VOLTAGE_LIMITS,
+                                         smu=glitching_smu({6}), PROBE=PROBE, name="late.csv")
+        self.assertIsInstance(error, control_modes.SafetyAbort)
+        self.assertIn("저항 급변", rows[-1]["abort_reason"])
+        self.assertEqual(rows[-1]["probe_active"], "1")
+        self.assertFalse(smu._output_enabled)
+        # Other limits are not excluded: power over P_max in an excluded sample.
+        smu, rows, error = self.run_mode(
+            "voltage", profile, VOLTAGE_LIMITS, PROBE=PROBE, name="power.csv",
+            smu=glitching_smu(set(), extra=lambda m: driver.Measurement(0.1, 20.0, 0.005)))
+        self.assertIsInstance(error, control_modes.SafetyAbort)
+        self.assertIn("측정 전력", rows[-1]["abort_reason"])
+        self.assertFalse(smu._output_enabled)
+
+    def test_current_mode_probe_voltage_over_limit_aborts(self):
+        smu = recorder.DummySourceMeasureUnit(base_resistance=1000.0)   # open contact
+        smu, rows, error = self.run_mode("current", [(0.0, 1.0)], CURRENT_LIMITS, smu=smu,
+                                         PROBE=PROBE)
+        self.assertIsInstance(error, control_modes.SafetyAbort)
+        self.assertIn("V_probe_max", rows[-1]["abort_reason"])
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(smu._output_enabled)
+
+    def test_probe_settings_validated_before_start(self):
+        for mode, probe, limits, message in (
+                ("voltage", dict(PROBE, I_probe_A=5e-5), VOLTAGE_LIMITS, "R 유효 기준"),
+                ("voltage", dict(PROBE, I_probe_A=0.2), VOLTAGE_LIMITS, "I_lim"),
+                ("power", dict(PROBE, V_probe_max_V=20.0), POWER_LIMITS, "V_max"),
+                ("current", dict(PROBE, I_probe_A=0.2), CURRENT_LIMITS, "I_max"),
+                ("voltage", PROBE, None, "requires SAFETY_LIMITS")):
+            smu = recorder.DummySourceMeasureUnit()
+            with self.subTest(message=message), patch.multiple(
+                    recorder, CONTROL_MODE=mode, PROFILE=[(0.0, 1.0)], SAFETY_LIMITS=limits,
+                    PROBE=probe, use_serial_marker=False, CURRENT_LIMIT=0.16):
+                with self.assertRaisesRegex(ValueError, message):
+                    recorder.run_profile(smu, Path(self.temp.name) / "never.csv")
+                self.assertFalse(smu._connected)
 
 
 class ProfileStoreTests(unittest.TestCase):

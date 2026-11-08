@@ -222,14 +222,45 @@ class SafetyMonitor:
         self.mode = mode
         self.limits = flat
         self.previous_resistance: float | None = None
+        self.jump_skip = 0
 
-    def check(self, set_value: float, command_voltage: float | None, measured) -> str:
+    def skip_jump_check(self, samples: int) -> None:
+        """Exclude the next *samples* samples from the R-jump check only.
+
+        Used right after the measurement current regime changes (heating
+        current <-> probe current), where the instrument's auto range may
+        switch and R can glitch.  Every other limit is still checked.
+        """
+        self.jump_skip = max(int(samples), 0)
+        self.previous_resistance = None
+
+    def check(self, set_value: float, command_voltage: float | None, measured,
+              probe_v_max: float | None = None) -> str:
+        """Return an abort reason ("" if every limit holds).
+
+        *probe_v_max* is given while the probe current is being sourced in a
+        0-output step: the probe command voltage (voltage source) or the
+        measured voltage (current source) must stay at or below it.
+        """
         limits = self.limits
         if not (math.isfinite(measured.voltage) and math.isfinite(measured.current)):
             return (
                 f"측정값이 유한하지 않음 (V={measured.voltage}, I={measured.current})"
             )
         power = abs(measured.voltage * measured.current)
+
+        if probe_v_max is not None:
+            if command_voltage is not None:
+                if command_voltage > probe_v_max + 1e-9:
+                    return (
+                        f"측정 전류 구간 명령 전압 {command_voltage:.4g} V > "
+                        f"V_probe_max {probe_v_max:g} V"
+                    )
+            elif abs(measured.voltage) > probe_v_max:
+                return (
+                    f"측정 전류 구간 측정 전압 {measured.voltage:.4g} V > "
+                    f"V_probe_max {probe_v_max:g} V (접촉 불량/단선 의심)"
+                )
 
         if self.mode == "voltage":
             if abs(set_value) > limits["V_max"]:
@@ -259,7 +290,12 @@ class SafetyMonitor:
                 )
 
         # Common: resistance must not jump between two consecutive valid samples.
-        if resistance_is_valid(measured):
+        if self.jump_skip > 0:
+            # Glitched samples must not become the reference either: the
+            # first valid sample after the window starts a new comparison.
+            self.jump_skip -= 1
+            self.previous_resistance = None
+        elif resistance_is_valid(measured):
             resistance = measured.resistance
             previous = self.previous_resistance
             self.previous_resistance = resistance
@@ -303,13 +339,20 @@ class PowerController:
             desired = self.command + self.max_step_v
         return max(desired, 0.0)
 
-    def start_step(self, target_power: float) -> float:
-        """Return the command voltage to apply at the start of a step."""
+    def start_step(self, target_power: float, keep_resistance: bool = False) -> float:
+        """Return the command voltage to apply at the start of a step.
+
+        For a 0 W step the last R is forgotten (it must be re-probed before
+        the next heating) unless *keep_resistance* is set: then the probe
+        current keeps R up to date through ``observe`` and the next heating
+        starts from the cooled-down R.
+        """
         self.target = float(target_power)
         self.failures = 0
         self.saturated = False
         if self.target <= 0.0:
-            self.last_resistance = None   # cooled down: R must be re-probed
+            if not keep_resistance:
+                self.last_resistance = None   # cooled down: R must be re-probed
             self.command = 0.0
         elif self.last_resistance is None:
             self.command = min(self.probe_v, self.v_max)
@@ -336,3 +379,114 @@ class PowerController:
                 return self.command, ""   # keep probing
         self.command = self._desired(self.last_resistance)
         return self.command, ""
+
+    def observe(self, measured, command_voltage: float) -> None:
+        """0 W step with probe current: track R and the actual output.
+
+        The next heating then starts from this (cold) R, rate-limited from
+        the probe voltage actually applied.
+        """
+        if resistance_is_valid(measured):
+            self.last_resistance = measured.resistance
+        self.command = float(command_voltage)
+
+
+# =============================================================================
+# Probe current in 0-output steps
+# =============================================================================
+
+DEFAULT_PROBE = {
+    "enabled": False,
+    "I_probe_A": 1e-3,
+    "V_probe_max_V": 0.2,
+    "R_jump_skip_samples": 2,
+}
+
+
+def normalize_probe(probe) -> dict | None:
+    """Fill defaults and check types.  None stays None (feature unused)."""
+    if probe is None:
+        return None
+    if not isinstance(probe, dict):
+        raise ValueError("측정 전류 설정 형식이 올바르지 않습니다.")
+    result = dict(DEFAULT_PROBE)
+    result.update({k: v for k, v in probe.items() if k in DEFAULT_PROBE})
+    result["enabled"] = bool(result["enabled"])
+    for key in ("I_probe_A", "V_probe_max_V"):
+        value = result[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"측정 전류 설정 '{key}'은(는) 0보다 큰 유한한 숫자여야 합니다.")
+        result[key] = float(value)
+    skip = result["R_jump_skip_samples"]
+    if isinstance(skip, bool) or not isinstance(skip, (int, float)) \
+            or skip != int(skip) or skip < 0:
+        raise ValueError("R 급변 검사 제외 샘플 수는 0 이상의 정수여야 합니다.")
+    result["R_jump_skip_samples"] = int(skip)
+    return result
+
+
+def validate_probe(mode: str, probe: dict, flat: dict,
+                   current_limit: float | None = None,
+                   voltage_limit: float | None = None) -> None:
+    """Pre-start check of the probe settings against the mode's limits."""
+    i_probe, v_probe = probe["I_probe_A"], probe["V_probe_max_V"]
+    if i_probe < R_VALID_MIN_CURRENT_A:
+        raise ValueError(
+            f"측정 전류 {i_probe * 1e3:g} mA는 R 유효 기준 "
+            f"{R_VALID_MIN_CURRENT_A * 1e3:g} mA 이상이어야 합니다."
+        )
+    if mode == "current":
+        if i_probe > flat["I_max"]:
+            raise ValueError(
+                f"측정 전류 {i_probe * 1e3:g} mA > I_max {flat['I_max'] * 1e3:g} mA"
+            )
+        v_lim = flat.get("V_lim", voltage_limit)
+        if v_lim is not None and v_probe > v_lim:
+            raise ValueError(f"V_probe_max {v_probe:g} V > V_lim {v_lim:g} V")
+    else:
+        i_lim = flat.get("I_lim", current_limit)
+        if i_lim is not None and i_probe > i_lim:
+            raise ValueError(
+                f"측정 전류 {i_probe * 1e3:g} mA > I_lim {i_lim * 1e3:g} mA"
+            )
+        if v_probe > flat["V_max"]:
+            raise ValueError(f"V_probe_max {v_probe:g} V > V_max {flat['V_max']:g} V")
+
+
+class ProbeController:
+    """Small measurement current on a voltage source: V = I_probe * R.
+
+    R is the latest valid resistance.  Without a valid R the first command
+    is V_probe_max / 4 and it is doubled (up to V_probe_max) while too
+    little current flows to trust R.  The command never exceeds V_probe_max.
+    """
+
+    def __init__(self, i_probe: float, v_probe_max: float):
+        self.i_probe = float(i_probe)
+        self.v_max = float(v_probe_max)
+        self.last_resistance: float | None = None
+        self.command = 0.0
+
+    def _from_resistance(self) -> float:
+        return min(self.i_probe * self.last_resistance, self.v_max)
+
+    def start(self, resistance_hint: float | None = None) -> float:
+        if resistance_hint is not None and math.isfinite(resistance_hint) \
+                and resistance_hint > 0:
+            self.last_resistance = float(resistance_hint)
+        if self.last_resistance is not None:
+            self.command = self._from_resistance()
+        else:
+            self.command = self.v_max / 4.0
+        return self.command
+
+    def update(self, measured) -> float:
+        if resistance_is_valid(measured):
+            self.last_resistance = measured.resistance
+            self.command = self._from_resistance()
+        elif not (math.isfinite(measured.current)
+                  and abs(measured.current) >= R_VALID_MIN_CURRENT_A):
+            # Too little current to measure R: raise the probe voltage.
+            self.command = min(max(self.command, self.v_max / 4.0) * 2.0, self.v_max)
+        return self.command
