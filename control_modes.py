@@ -1,0 +1,338 @@
+"""Control modes (voltage / power / current), safety limits and the power loop.
+
+This module has no GUI or instrument dependency so it can be unit-tested and
+shared by the GUI and the CLI recorder.
+
+All values handled here are SI units (V, W, A).  The GUI converts mA <-> A.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+# =============================================================================
+# Mode definitions
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class ModeInfo:
+    key: str
+    label: str          # button text
+    quantity: str       # table header word
+    unit: str           # GUI unit
+    si_unit: str        # unit stored in profiles / CSV
+    scale: float        # GUI value * scale = SI value
+
+
+MODES = {
+    "voltage": ModeInfo("voltage", "전압 모드", "전압", "V", "V", 1.0),
+    "power": ModeInfo("power", "전력 모드", "전력", "W", "W", 1.0),
+    "current": ModeInfo("current", "전류 모드", "전류", "mA", "A", 1e-3),
+}
+
+MODE_KEYS = tuple(MODES)
+
+
+def mode_info(mode: str) -> ModeInfo:
+    try:
+        return MODES[mode]
+    except KeyError:
+        raise ValueError(
+            f"Unknown control mode: {mode!r} (choose one of {', '.join(MODES)})"
+        ) from None
+
+
+# =============================================================================
+# Safety limit definitions
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class LimitField:
+    key: str
+    label: str
+    unit: str           # GUI unit
+    scale: float = 1.0  # GUI value * scale = stored value
+    integer: bool = False
+    hardware: bool = False  # instrument compliance (CURRENT_LIMIT / VOLTAGE_LIMIT)
+
+
+I_LIM_FIELD = LimitField("I_lim", "전류 제한 I_lim · 장비 compliance", "A", hardware=True)
+
+LIMIT_FIELDS = {
+    "voltage": (
+        I_LIM_FIELD,
+        LimitField("V_max", "설정 전압 상한 V_max", "V"),
+        LimitField("P_max", "측정 전력 상한 P_max", "W"),
+    ),
+    "current": (
+        LimitField("V_lim", "전압 제한 V_lim · 장비 compliance", "V", hardware=True),
+        LimitField("I_max", "설정 전류 상한 I_max", "mA", 1e-3),
+        LimitField("P_max", "측정 전력 상한 P_max", "W"),
+    ),
+    "power": (
+        I_LIM_FIELD,
+        LimitField("P_max", "목표 전력 상한 P_max (측정 ≤ ×1.1)", "W"),
+        LimitField("V_max", "명령 전압 상한 V_max", "V"),
+    ),
+    "common": (
+        LimitField("R_jump_pct", "R 급변 한계 (샘플 간)", "%"),
+    ),
+    "power_control": (
+        LimitField("probe_V", "탐침 전압", "V"),
+        LimitField("max_step_V", "샘플당 최대 전압 증가", "V"),
+        LimitField("max_R_failures", "R 연속 실패 허용", "회", integer=True),
+    ),
+}
+
+DEFAULT_LIMITS = {
+    "voltage": {"I_lim": 0.16, "V_max": 12.0, "P_max": 1.5},
+    "current": {"V_lim": 12.0, "I_max": 0.16, "P_max": 1.5},
+    "power": {"I_lim": 0.16, "P_max": 1.5, "V_max": 12.0},
+    "common": {"R_jump_pct": 5.0},
+    "power_control": {"probe_V": 0.1, "max_step_V": 1.0, "max_R_failures": 3},
+}
+
+# Keithley 2450 source ranges (front-panel spec: ±1.05 A, ±210 V).
+HARDWARE_MAX_CURRENT_A = 1.05
+HARDWARE_MAX_VOLTAGE_V = 210.0
+
+# Measured power may exceed the power-mode target ceiling by this factor
+# before the run is aborted (control error / noise margin).
+POWER_MODE_MEASURED_MARGIN = 1.1
+
+# A resistance reading is only trusted when at least this much current flows.
+# At 0 V the instrument returns offset/noise current and R = V/I is meaningless.
+# 0.1 mA keeps a 0.1 V probe valid up to 1 kOhm.  Adjust after checking the
+# real instrument's noise floor (실장비 확인 필요).
+R_VALID_MIN_CURRENT_A = 1e-4
+
+
+def groups_for_mode(mode: str) -> tuple[str, ...]:
+    """Limit groups used by a mode (in GUI / profile order)."""
+    mode_info(mode)
+    groups = (mode, "common")
+    if mode == "power":
+        groups += ("power_control",)
+    return groups
+
+
+def runtime_limits(mode: str, limits: dict) -> dict:
+    """Flatten the groups used by *mode* into one dict for the recorder."""
+    flat = {}
+    for group in groups_for_mode(mode):
+        flat.update(limits[group])
+    return flat
+
+
+def validate_limits(mode: str, flat: dict) -> None:
+    """Raise ValueError if the flat limit dict for *mode* is unusable."""
+
+    def require(key):
+        if key not in flat:
+            raise ValueError(f"안전 상한 '{key}' 값이 없습니다.")
+        value = flat[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"안전 상한 '{key}' 값이 숫자가 아닙니다.")
+        value = float(value)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"안전 상한 '{key}'은(는) 0보다 큰 유한한 숫자여야 합니다.")
+        return value
+
+    # Hardware compliance values travel separately (CURRENT_LIMIT /
+    # VOLTAGE_LIMIT) and are only checked here when present.
+    for group in groups_for_mode(mode):
+        for field in LIMIT_FIELDS[group]:
+            if not field.hardware or field.key in flat:
+                require(field.key)
+
+    if "I_lim" in flat and require("I_lim") > HARDWARE_MAX_CURRENT_A:
+        raise ValueError(f"I_lim은 장비 최대 {HARDWARE_MAX_CURRENT_A} A 이하여야 합니다.")
+    if "V_lim" in flat and require("V_lim") > HARDWARE_MAX_VOLTAGE_V:
+        raise ValueError(f"V_lim은 장비 최대 {HARDWARE_MAX_VOLTAGE_V} V 이하여야 합니다.")
+    if mode == "power":
+        if require("probe_V") > require("V_max"):
+            raise ValueError("탐침 전압은 명령 전압 상한 V_max 이하여야 합니다.")
+        failures = flat["max_R_failures"]
+        if float(failures) != int(failures) or int(failures) < 1:
+            raise ValueError("R 연속 실패 허용 횟수는 1 이상의 정수여야 합니다.")
+
+
+def profile_violations(mode: str, values, flat: dict) -> list[str]:
+    """Pre-start check: one message per profile row that breaks a limit.
+
+    *values* are SI step values in profile order (row numbers start at 1).
+    """
+    messages = []
+    for row, value in enumerate(values, 1):
+        if mode == "voltage":
+            if abs(value) > flat["V_max"]:
+                messages.append(
+                    f"{row}행: 설정 전압 {value:g} V > V_max {flat['V_max']:g} V"
+                )
+        elif mode == "current":
+            if abs(value) > flat["I_max"]:
+                messages.append(
+                    f"{row}행: 설정 전류 {value * 1e3:g} mA > "
+                    f"I_max {flat['I_max'] * 1e3:g} mA"
+                )
+        elif mode == "power":
+            if value < 0:
+                messages.append(f"{row}행: 목표 전력은 음수일 수 없습니다 ({value:g} W)")
+            elif value > flat["P_max"]:
+                messages.append(
+                    f"{row}행: 목표 전력 {value:g} W > P_max {flat['P_max']:g} W"
+                )
+        else:
+            mode_info(mode)
+    return messages
+
+
+# =============================================================================
+# Runtime checks
+# =============================================================================
+
+
+class SafetyAbort(RuntimeError):
+    """Raised after the output was switched off because a limit was exceeded."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def resistance_is_valid(measured) -> bool:
+    """True when R = V/I from this sample can be trusted."""
+    return (
+        math.isfinite(measured.voltage)
+        and math.isfinite(measured.current)
+        and abs(measured.current) >= R_VALID_MIN_CURRENT_A
+        and math.isfinite(measured.resistance)
+        and measured.resistance > 0
+    )
+
+
+class SafetyMonitor:
+    """Per-sample software limit checks.  ``check`` returns an abort reason."""
+
+    def __init__(self, mode: str, flat: dict):
+        mode_info(mode)
+        self.mode = mode
+        self.limits = flat
+        self.previous_resistance: float | None = None
+
+    def check(self, set_value: float, command_voltage: float | None, measured) -> str:
+        limits = self.limits
+        if not (math.isfinite(measured.voltage) and math.isfinite(measured.current)):
+            return (
+                f"측정값이 유한하지 않음 (V={measured.voltage}, I={measured.current})"
+            )
+        power = abs(measured.voltage * measured.current)
+
+        if self.mode == "voltage":
+            if abs(set_value) > limits["V_max"]:
+                return f"설정 전압 {set_value:g} V > V_max {limits['V_max']:g} V"
+            if power > limits["P_max"]:
+                return f"측정 전력 {power:.4g} W > P_max {limits['P_max']:g} W"
+        elif self.mode == "current":
+            if abs(set_value) > limits["I_max"]:
+                return (
+                    f"설정 전류 {set_value * 1e3:g} mA > "
+                    f"I_max {limits['I_max'] * 1e3:g} mA"
+                )
+            if power > limits["P_max"]:
+                return f"측정 전력 {power:.4g} W > P_max {limits['P_max']:g} W"
+        else:  # power
+            if set_value > limits["P_max"]:
+                return f"목표 전력 {set_value:g} W > P_max {limits['P_max']:g} W"
+            if command_voltage is not None and command_voltage > limits["V_max"] + 1e-9:
+                return (
+                    f"명령 전압 {command_voltage:.4g} V > V_max {limits['V_max']:g} V"
+                )
+            ceiling = limits["P_max"] * POWER_MODE_MEASURED_MARGIN
+            if power > ceiling:
+                return (
+                    f"측정 전력 {power:.4g} W > P_max×{POWER_MODE_MEASURED_MARGIN:g} "
+                    f"= {ceiling:.4g} W"
+                )
+
+        # Common: resistance must not jump between two consecutive valid samples.
+        if resistance_is_valid(measured):
+            resistance = measured.resistance
+            previous = self.previous_resistance
+            self.previous_resistance = resistance
+            if previous is not None:
+                change_pct = abs(resistance - previous) / previous * 100.0
+                if change_pct > limits["R_jump_pct"]:
+                    return (
+                        f"저항 급변 {previous:.4g} → {resistance:.4g} ohm "
+                        f"({change_pct:.2f}% > {limits['R_jump_pct']:g}%)"
+                    )
+        else:
+            self.previous_resistance = None
+        return ""
+
+
+class PowerController:
+    """Software constant-power loop on top of a voltage source.
+
+    Command voltage V = sqrt(P_target * R), with R = V_meas / I_meas from the
+    latest valid sample.  Increases are rate-limited to ``max_step_V`` per
+    sample; decreases are applied immediately (the safe direction).
+    The command never exceeds ``V_max``.
+    """
+
+    def __init__(self, flat: dict):
+        self.v_max = float(flat["V_max"])
+        self.probe_v = float(flat["probe_V"])
+        self.max_step_v = float(flat["max_step_V"])
+        self.max_failures = int(flat["max_R_failures"])
+        self.command = 0.0
+        self.target = 0.0
+        self.last_resistance: float | None = None
+        self.failures = 0
+        self.saturated = False
+
+    def _desired(self, resistance: float) -> float:
+        desired = math.sqrt(self.target * resistance)
+        self.saturated = desired > self.v_max
+        desired = min(desired, self.v_max)
+        if desired > self.command + self.max_step_v:
+            desired = self.command + self.max_step_v
+        return max(desired, 0.0)
+
+    def start_step(self, target_power: float) -> float:
+        """Return the command voltage to apply at the start of a step."""
+        self.target = float(target_power)
+        self.failures = 0
+        self.saturated = False
+        if self.target <= 0.0:
+            self.last_resistance = None   # cooled down: R must be re-probed
+            self.command = 0.0
+        elif self.last_resistance is None:
+            self.command = min(self.probe_v, self.v_max)
+        else:
+            self.command = self._desired(self.last_resistance)
+        return self.command
+
+    def update(self, measured) -> tuple[float, str]:
+        """Return (next command voltage, abort reason or "")."""
+        if self.target <= 0.0:
+            self.command = 0.0
+            return 0.0, ""
+        if resistance_is_valid(measured):
+            self.last_resistance = measured.resistance
+            self.failures = 0
+        else:
+            self.failures += 1
+            if self.failures >= self.max_failures:
+                return 0.0, (
+                    f"전력 모드: 유효한 저항을 {self.failures}회 연속 얻지 못함 "
+                    f"(V={measured.voltage:.4g} V, I={measured.current:.4g} A)"
+                )
+            if self.last_resistance is None:
+                return self.command, ""   # keep probing
+        self.command = self._desired(self.last_resistance)
+        return self.command, ""
