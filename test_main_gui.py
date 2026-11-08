@@ -17,6 +17,7 @@ import control_modes
 import keithley_driver as driver
 import main_gui
 import manual_voltage_profile as recorder
+import profile_store
 
 
 class GUIIntegrationTests(unittest.TestCase):
@@ -297,6 +298,75 @@ class ControlModeRecorderTests(unittest.TestCase):
         self.assertEqual(recorder.infer_state(0.5, 0.3), "cooling")
         self.assertEqual(recorder.infer_state(0.3, 0.3), "hold")
         self.assertEqual(recorder.infer_state(0.0, 0.0), "off_hold")
+
+
+class ProfileStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.temp.name) / "profiles"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_name_validation(self):
+        # Surrounding spaces are trimmed, not rejected.
+        self.assertEqual(profile_store.validate_name("  0.5W 가열 10초  "), "0.5W 가열 10초")
+        for bad in ("", "  ", "a/b", "a\\b", "a:b", 'a"b', "a*b", "a?b", "a<b", "a|b",
+                    "tab\there", "끝점.", "점 .", "CON", "com1.json", "x" * 101,
+                    "default", "EXP4"):
+            with self.subTest(name=bad), self.assertRaises(ValueError):
+                profile_store.validate_name(bad)
+
+    def test_save_list_load_delete_round_trip(self):
+        data = {"name": "전력 테스트", "mode": "power",
+                "steps": [{"value": 0.5, "duration_s": 10, "note": "가열"},
+                          {"value": 0, "duration_s": 30, "note": ""}],
+                "limits": {"power": {"I_lim": 0.16, "P_max": 1.0, "V_max": 10.0},
+                           "common": {"R_jump_pct": 5.0}},
+                "description": "설명"}
+        path = profile_store.save_profile(data, self.dir)
+        self.assertEqual(path.name, "전력 테스트.json")
+        with self.assertRaises(FileExistsError):
+            profile_store.save_profile(data, self.dir)
+        first = profile_store.load_profile(path)
+        profile_store.save_profile(dict(data, description="수정"), self.dir, overwrite=True)
+        loaded = profile_store.load_profile(path)
+        self.assertEqual(loaded["created_at"], first["created_at"])
+        self.assertEqual(loaded["description"], "수정")
+        self.assertEqual(loaded["steps"], [
+            {"value": 0.5, "duration_s": 10.0, "note": "가열"},
+            {"value": 0.0, "duration_s": 30.0, "note": ""}])
+        self.assertEqual(loaded["limits"]["power"]["P_max"], 1.0)
+
+        summaries, errors = profile_store.list_profiles(self.dir)
+        self.assertEqual(errors, [])
+        user = [s for s in summaries if not s["builtin"]]
+        self.assertEqual([(s["name"], s["mode"], s["steps"], s["total_s"]) for s in user],
+                         [("전력 테스트", "power", 2, 40.0)])
+        builtin = {s["name"]: s for s in summaries if s["builtin"]}
+        self.assertEqual(builtin["exp4"]["mode"], "voltage")
+
+        profile_store.delete_profile("전력 테스트", self.dir)
+        self.assertFalse(path.exists())
+
+    def test_broken_files_are_reported_not_fatal(self):
+        self.dir.mkdir()
+        (self.dir / "broken.json").write_text("{", encoding="utf-8")
+        (self.dir / "bad_mode.json").write_text(
+            json.dumps({"mode": "magic", "steps": [{"value": 1, "duration_s": 1}]}),
+            encoding="utf-8")
+        summaries, errors = profile_store.list_profiles(self.dir)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(all(s["builtin"] for s in summaries))
+
+    def test_last_settings(self):
+        path = Path(self.temp.name) / "settings" / "last_settings.json"
+        self.assertEqual(profile_store.load_last_settings(path), {})
+        profile_store.save_last_settings({"limits": {"common": {"R_jump_pct": 7}}}, path)
+        self.assertEqual(profile_store.load_last_settings(path)["limits"],
+                         {"common": {"R_jump_pct": 7}})
+        path.write_text("not json", encoding="utf-8")
+        self.assertEqual(profile_store.load_last_settings(path), {})
 
 
 class FakeInstrument:
