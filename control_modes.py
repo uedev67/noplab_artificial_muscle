@@ -490,3 +490,215 @@ class ProbeController:
             # Too little current to measure R: raise the probe voltage.
             self.command = min(max(self.command, self.v_max / 4.0) * 2.0, self.v_max)
         return self.command
+
+
+# =============================================================================
+# Step options: conditional cooling end / R_ref measurement step
+#
+# Step option dict (same keys as a profile JSON step):
+#   {}                                              fixed duration (default)
+#   {"end": {"type": "rref", "t_min_s", "tol_pct", "k_samples"}}
+#   {"end": {"type": "slope", "t_min_s", "window_s", "slope_pct_per_s"}}
+#   {"kind": "rref", "rref": {"t_on_s", "t_off_s", "repeats"}}
+# For a conditional step the step duration is t_max.
+# =============================================================================
+
+DEFAULT_T_MAX_S = 40.0
+
+DEFAULT_END = {
+    "rref": {"t_min_s": 10.0, "tol_pct": 0.5, "k_samples": 5},
+    "slope": {"t_min_s": 10.0, "window_s": 2.0, "slope_pct_per_s": 0.05},
+}
+
+END_LABELS = {"rref": "R_ref 복귀", "slope": "R 안정(기울기)"}
+
+DEFAULT_COOLING = {"timeout_abort": False, "timeout_abort_count": 2}
+
+
+def _positive(value, what: str, allow_zero: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+        bound = "0 이상" if allow_zero else "0보다 큰"
+        raise ValueError(f"{what}은(는) {bound} 유한한 숫자여야 합니다.")
+    return float(value)
+
+
+def _count(value, what: str, minimum: int = 1) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) \
+            or not math.isfinite(value) or value != int(value) or value < minimum:
+        raise ValueError(f"{what}은(는) {minimum} 이상의 정수여야 합니다.")
+    return int(value)
+
+
+def normalize_end(end) -> dict | None:
+    """Conditional end spec with defaults filled in.  None / fixed -> None."""
+    if end is None:
+        return None
+    if not isinstance(end, dict):
+        raise ValueError("냉각 종료 조건 형식이 올바르지 않습니다.")
+    kind = end.get("type", "fixed")
+    if kind == "fixed":
+        return None
+    if kind not in DEFAULT_END:
+        raise ValueError(f"알 수 없는 냉각 종료 조건: {kind!r}")
+    result = {"type": kind, **DEFAULT_END[kind]}
+    result.update({k: v for k, v in end.items() if k in DEFAULT_END[kind]})
+    result["t_min_s"] = _positive(result["t_min_s"], "최소 시간 t_min", allow_zero=True)
+    if kind == "rref":
+        result["tol_pct"] = _positive(result["tol_pct"], "R_ref 허용 오차")
+        result["k_samples"] = _count(result["k_samples"], "연속 샘플 수 k")
+    else:
+        result["window_s"] = _positive(result["window_s"], "기울기 창 w")
+        result["slope_pct_per_s"] = _positive(result["slope_pct_per_s"], "기울기 기준 s")
+    return result
+
+
+def normalize_step_options(options) -> dict:
+    """Validate a step option dict (see above) and fill defaults."""
+    if not options:
+        return {}
+    if not isinstance(options, dict):
+        raise ValueError("단계 옵션 형식이 올바르지 않습니다.")
+    result = {}
+    if options.get("kind", "normal") == "rref":
+        result["kind"] = "rref"
+        result["rref"] = normalize_rref_step(options.get("rref"))
+    elif options.get("kind", "normal") != "normal":
+        raise ValueError(f"알 수 없는 단계 종류: {options.get('kind')!r}")
+    end = normalize_end(options.get("end"))
+    if end is not None:
+        result["end"] = end
+    return result
+
+
+def validate_step_plan(steps, probe: dict | None, manual_r_ref: float | None) -> list[str]:
+    """Pre-start check of step options.  *steps* = [(value, duration, options)].
+
+    Returns one message per problem (row numbers start at 1).
+    """
+    messages = []
+    probe_enabled = probe is not None and probe.get("enabled")
+    r_ref_known = manual_r_ref is not None
+    for row, (value, duration, options) in enumerate(steps, 1):
+        try:
+            options = normalize_step_options(options)
+        except ValueError as exc:
+            messages.append(f"{row}행: {exc}")
+            continue
+        end = options.get("end")
+        if options.get("kind") == "rref":
+            spec = options["rref"]
+            if value != 0:
+                messages.append(f"{row}행: R_ref 측정 단계의 값은 0이어야 합니다.")
+            if probe is None:
+                messages.append(f"{row}행: R_ref 측정 단계에는 측정 전류 설정이 필요합니다.")
+            planned = rref_step_duration(spec)
+            if abs(duration - planned) > 1e-6:
+                messages.append(
+                    f"{row}행: R_ref 측정 단계 시간 {duration:g} s ≠ "
+                    f"반복 {spec['repeats']} × (on {spec['t_on_s']:g} + off {spec['t_off_s']:g}) "
+                    f"= {planned:g} s"
+                )
+            if end is not None:
+                messages.append(f"{row}행: R_ref 측정 단계에는 조건부 종료를 쓸 수 없습니다.")
+            r_ref_known = True
+            continue
+        if end is None:
+            continue
+        if value != 0:
+            messages.append(f"{row}행: 조건부 종료는 값이 0인 단계에서만 쓸 수 있습니다.")
+        if not probe_enabled:
+            messages.append(f"{row}행: 조건부 종료는 냉각 중 측정 전류가 켜져 있어야 합니다.")
+        if duration < end["t_min_s"]:
+            messages.append(
+                f"{row}행: 최대 시간 {duration:g} s < 최소 시간 t_min {end['t_min_s']:g} s"
+            )
+        if end["type"] == "rref" and not r_ref_known:
+            messages.append(
+                f"{row}행: R_ref 복귀 조건에 쓸 R_ref가 없습니다 "
+                "(앞쪽에 R_ref 측정 단계를 넣거나 R_ref를 직접 입력하세요)."
+            )
+    return messages
+
+
+class CoolingCondition:
+    """Conditional end of a 0-output (probe current) step.
+
+    rref : |R - R_ref| / R_ref <= tol for k consecutive valid samples.
+    slope: least-squares |dR/dt| / mean(R) <= s over the last w seconds of
+           valid samples (the window must span w seconds).
+    Never ends before t_min.  An invalid sample restarts the count/window.
+    """
+
+    def __init__(self, end: dict, r_ref: float | None):
+        self.end = end
+        self.kind = end["type"]
+        self.r_ref = r_ref
+        self.consecutive = 0
+        self.window: list[tuple[float, float]] = []
+        self.metric: float | None = None   # deviation % or slope %/s
+
+    def update(self, elapsed: float, measured) -> bool:
+        if not resistance_is_valid(measured):
+            self.consecutive = 0
+            self.window.clear()
+            self.metric = None
+            return False
+        resistance = measured.resistance
+        if self.kind == "rref":
+            if self.r_ref is None:
+                return False
+            self.metric = abs(resistance - self.r_ref) / self.r_ref * 100.0
+            self.consecutive = self.consecutive + 1 if self.metric <= self.end["tol_pct"] else 0
+            met = self.consecutive >= self.end["k_samples"]
+        else:
+            window_s = self.end["window_s"]
+            self.window.append((elapsed, resistance))
+            # Keep the newest sample that is at least w old as the window start.
+            while len(self.window) > 2 and self.window[1][0] <= elapsed - window_s:
+                self.window.pop(0)
+            met = False
+            span = self.window[-1][0] - self.window[0][0]
+            if len(self.window) >= 3 and span >= window_s - 1e-9:
+                slope = _slope(self.window)
+                mean = sum(r for _, r in self.window) / len(self.window)
+                self.metric = abs(slope) / mean * 100.0
+                met = self.metric <= self.end["slope_pct_per_s"]
+        return met and elapsed >= self.end["t_min_s"]
+
+
+def _slope(points) -> float:
+    n = len(points)
+    mean_t = sum(t for t, _ in points) / n
+    mean_r = sum(r for _, r in points) / n
+    num = sum((t - mean_t) * (r - mean_r) for t, r in points)
+    den = sum((t - mean_t) ** 2 for t, _ in points)
+    return num / den if den > 0 else 0.0
+
+
+# =============================================================================
+# R_ref measurement step
+# =============================================================================
+
+DEFAULT_RREF_STEP = {"t_on_s": 5.0, "t_off_s": 5.0, "repeats": 3}
+
+# R_ref = mean over on-segments of the mean R in the last RREF_AVERAGE_S of
+# each on-segment (the whole on-segment when it is shorter).
+RREF_AVERAGE_S = 3.0
+
+
+def normalize_rref_step(spec) -> dict:
+    if spec is None:
+        spec = {}
+    if not isinstance(spec, dict):
+        raise ValueError("R_ref 측정 단계 형식이 올바르지 않습니다.")
+    result = dict(DEFAULT_RREF_STEP)
+    result.update({k: v for k, v in spec.items() if k in DEFAULT_RREF_STEP})
+    result["t_on_s"] = _positive(result["t_on_s"], "R_ref on 시간")
+    result["t_off_s"] = _positive(result["t_off_s"], "R_ref off 시간", allow_zero=True)
+    result["repeats"] = _count(result["repeats"], "R_ref 반복 횟수")
+    return result
+
+
+def rref_step_duration(spec: dict) -> float:
+    return float(f"{spec['repeats'] * (spec['t_on_s'] + spec['t_off_s']):.12g}")

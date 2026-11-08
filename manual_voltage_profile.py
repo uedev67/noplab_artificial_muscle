@@ -45,15 +45,18 @@ from voltage_profiles import PROFILES
 
 from control_modes import (
     MODES,
+    CoolingCondition,
     PowerController,
     ProbeController,
     SafetyAbort,
     SafetyMonitor,
     normalize_probe,
+    normalize_step_options,
     profile_violations,
     resistance_is_valid,
     validate_limits,
     validate_probe,
+    validate_step_plan,
 )
 from keithley_driver import (
     DummySourceMeasureUnit,
@@ -152,6 +155,27 @@ SAFETY_LIMITS = None
 # ---------------------------------------------------------------------------
 
 PROBE = None
+
+# ---------------------------------------------------------------------------
+# Conditional cooling / R_ref
+#
+# A PROFILE entry may carry a 5th element with step options:
+#   (0.0, 40.0, 1, "cool", {"end": {"type": "rref", "t_min_s": 10,
+#                                   "tol_pct": 0.5, "k_samples": 5}})
+#   (0.0, 40.0, 1, "cool", {"end": {"type": "slope", "t_min_s": 10,
+#                                   "window_s": 2, "slope_pct_per_s": 0.05}})
+#   (0.0, 30.0, 1, "R_ref", {"kind": "rref",
+#                            "rref": {"t_on_s": 5, "t_off_s": 5, "repeats": 3}})
+# Conditional steps need the probe current; their duration is t_max.
+#
+# MANUAL_R_REF: R_ref (ohm) used until an R_ref step measures one.
+# COOLING_TIMEOUT_ABORT: None (off) or M -> safety stop after M consecutive
+#   conditional-cooling timeouts.
+# ---------------------------------------------------------------------------
+
+MANUAL_R_REF = None
+
+COOLING_TIMEOUT_ABORT = None
 
 # 아두이노 마커 시스템 스위치(False이면 아두이노 미사용)
 use_serial_marker = True
@@ -389,9 +413,9 @@ def parse_profile_entry(
 
         note = ""
 
-    elif len(entry) == 4:
+    elif len(entry) in (4, 5):
 
-        voltage, duration, cycle_index, note = entry
+        voltage, duration, cycle_index, note = entry[:4]
 
     else:
 
@@ -399,7 +423,7 @@ def parse_profile_entry(
             "PROFILE entry must be "
             "(voltage, duration) "
             "or "
-            "(voltage, duration, cycle_index, note)"
+            "(voltage, duration, cycle_index, note[, options])"
         )
 
     return (
@@ -408,6 +432,15 @@ def parse_profile_entry(
         int(cycle_index),
         str(note),
     )
+
+
+def profile_entry_options(entry) -> dict:
+    """Step options of a PROFILE entry ({} = fixed-duration normal step)."""
+
+    if len(entry) == 5:
+        return normalize_step_options(entry[4])
+
+    return {}
 
 
 def infer_state(
@@ -585,6 +618,37 @@ def validate_settings() -> None:
             voltage_limit=VOLTAGE_LIMIT,
         )
 
+    if MANUAL_R_REF is not None and (
+        not isinstance(MANUAL_R_REF, (int, float))
+        or not math.isfinite(MANUAL_R_REF)
+        or MANUAL_R_REF <= 0
+    ):
+
+        raise ValueError("MANUAL_R_REF must be a positive number or None")
+
+    if COOLING_TIMEOUT_ABORT is not None and (
+        not isinstance(COOLING_TIMEOUT_ABORT, int)
+        or COOLING_TIMEOUT_ABORT < 1
+    ):
+
+        raise ValueError("COOLING_TIMEOUT_ABORT must be None or an integer >= 1")
+
+    plan = []
+
+    for entry in PROFILE:
+
+        value, duration, _, _ = parse_profile_entry(entry)
+
+        plan.append((value, duration, entry[4] if len(entry) == 5 else {}))
+
+    problems = validate_step_plan(plan, probe, MANUAL_R_REF)
+
+    if problems:
+
+        raise ValueError(
+            "PROFILE step options are invalid:\n" + "\n".join(problems)
+        )
+
 
 # =============================================================================
 # MAIN EXPERIMENT
@@ -724,6 +788,12 @@ def run_profile(
     if probe_enabled:
         extra_settings["probe"] = probe
 
+    if MANUAL_R_REF is not None:
+        extra_settings["manual_R_ref_ohm"] = MANUAL_R_REF
+
+    if COOLING_TIMEOUT_ABORT is not None:
+        extra_settings["cooling_timeout_abort"] = COOLING_TIMEOUT_ABORT
+
     limit_settings = json.dumps(
         {"mode": mode, **hardware_limit, **(SAFETY_LIMITS or {}), **extra_settings},
         ensure_ascii=False,
@@ -758,7 +828,10 @@ def run_profile(
     # (time, R) of valid samples since the last heating -> R_cold_before_heating
     cold_samples: deque = deque()
     r_cold_before_heating: float | str = ""
-    r_ref_value: float | None = None
+    r_ref_value: float | None = (
+        float(MANUAL_R_REF) if MANUAL_R_REF is not None else None
+    )
+    consecutive_timeouts = 0
 
 
     # -------------------------------------------------------------------------
@@ -890,6 +963,19 @@ def run_profile(
                 step_note,
             ) = parse_profile_entry(entry)
 
+            options = profile_entry_options(entry)
+
+            if options.get("kind") == "rref":
+                raise NotImplementedError("R_ref measurement step")
+
+            end_spec = options.get("end")
+
+            cooling_condition = (
+                CoolingCondition(end_spec, r_ref_value)
+                if end_spec is not None
+                else None
+            )
+
 
             state = infer_state(
                 previous_set_value,
@@ -964,6 +1050,23 @@ def run_profile(
 
             if step_note:
                 print(f"  note     : {step_note}")
+
+            if end_spec is not None:
+                if end_spec["type"] == "rref":
+                    rule = (
+                        f"|R-R_ref|/R_ref <= {end_spec['tol_pct']:g}% "
+                        f"x{end_spec['k_samples']} samples "
+                        f"(R_ref {r_ref_value:.6g} ohm)"
+                    )
+                else:
+                    rule = (
+                        f"|dR/dt|/R <= {end_spec['slope_pct_per_s']:g} %/s "
+                        f"over {end_spec['window_s']:g} s"
+                    )
+                print(
+                    f"  end      : condition {rule}, "
+                    f"t_min {end_spec['t_min_s']:g} s, t_max {duration_s:g} s"
+                )
 
             print()
 
@@ -1141,7 +1244,45 @@ def run_profile(
 
                 last_sample = next_sample_start >= step_start + duration_s
 
-                if last_sample and phase in ("cooling", "idle"):
+                condition_met = (
+                    cooling_condition is not None
+                    and not abort_reason
+                    and cooling_condition.update(
+                        measure_end - step_start, measured
+                    )
+                )
+
+                if condition_met:
+
+                    last_sample = True
+                    cooling_end_reason = "condition"
+                    cooling_duration = measure_end - step_start
+                    consecutive_timeouts = 0
+
+                elif last_sample and cooling_condition is not None:
+
+                    cooling_end_reason = "timeout"
+                    cooling_duration = duration_s
+                    consecutive_timeouts += 1
+
+                    print(
+                        f"WARNING: cooling condition not met within "
+                        f"t_max {duration_s:g} s (step {step_index}, "
+                        f"{consecutive_timeouts} in a row) -> next step"
+                    )
+
+                    if (
+                        COOLING_TIMEOUT_ABORT is not None
+                        and consecutive_timeouts >= COOLING_TIMEOUT_ABORT
+                        and not abort_reason
+                    ):
+                        abort_reason = (
+                            f"조건부 냉각 타임아웃 {consecutive_timeouts}회 연속 "
+                            f"(한계 {COOLING_TIMEOUT_ABORT}회)"
+                        )
+
+                elif last_sample and phase in ("cooling", "idle"):
+
                     cooling_end_reason = "fixed"
                     cooling_duration = duration_s
 
@@ -1494,9 +1635,13 @@ def run_profile(
                 # Sampling timing control
                 # -------------------------------------------------------------
 
-                if last_sample:
+                if condition_met:
 
-                    # Fixed duration: hold the output until the step ends.
+                    sleep_s = 0.0   # condition reached: next step right away
+
+                elif last_sample:
+
+                    # Fixed duration / t_max: hold the output until the step ends.
                     sleep_s = step_start + duration_s - time.monotonic()
 
                 else:

@@ -678,6 +678,94 @@ class ProbeCurrentTests(RecorderTestBase):
                 self.assertFalse(smu._connected)
 
 
+def cool(t_max, end, note="cool"):
+    return (0.0, t_max, 1, note, {"end": end})
+
+
+class ConditionalCoolingTests(RecorderTestBase):
+    """Conditional end of 0-output steps (조건부 냉각)."""
+
+    LIMITS = dict(VOLTAGE_LIMITS, R_jump_pct=50.0)   # training jumps R on purpose
+
+    def smu(self, training=0.0):
+        return recorder.DummySourceMeasureUnit(
+            base_resistance=30.0, current_limit=0.16, noise_ratio=0.0005,
+            time_constant_s=0.1, training_gain_per_w=training)
+
+    def test_rref_return_ends_cooling(self):
+        end = {"type": "rref", "t_min_s": 0.2, "tol_pct": 0.5, "k_samples": 5}
+        smu, rows, error = self.run_mode(
+            "voltage", [(2.0, 0.4), cool(5.0, end)], self.LIMITS, smu=self.smu(),
+            PROBE=PROBE, MANUAL_R_REF=30.0)
+        self.assertIsNone(error)
+        cooling = step_rows(rows, 2)
+        last = cooling[-1]
+        self.assertEqual(last["cooling_end_reason"], "condition")
+        self.assertTrue(all(r["cooling_end_reason"] == "" for r in cooling[:-1]))
+        duration = float(last["cooling_duration_s"])
+        self.assertGreaterEqual(duration, 0.2)
+        self.assertLess(duration, 2.0)
+        self.assertGreater(float(cooling[0]["resistance_ohm"]), 30.0 * 1.02)   # was hot
+        for row in cooling[-5:]:
+            self.assertLessEqual(abs(float(row["resistance_ohm"]) - 30.0) / 30.0, 0.005)
+            self.assertEqual(float(row["R_ref_ohm"]), 30.0)
+
+    def test_slope_ends_cooling_when_reference_moved(self):
+        # Training: cold R rises ~13 % for good, R_ref is never reached again.
+        end = {"type": "slope", "t_min_s": 0.2, "window_s": 0.3, "slope_pct_per_s": 0.5}
+        smu, rows, error = self.run_mode(
+            "voltage", [(2.0, 0.4), cool(5.0, end)], self.LIMITS, smu=self.smu(training=1.0),
+            PROBE=PROBE)
+        self.assertIsNone(error)
+        cooling = step_rows(rows, 2)
+        self.assertEqual(cooling[-1]["cooling_end_reason"], "condition")
+        self.assertLess(float(cooling[-1]["cooling_duration_s"]), 2.0)
+        settled = float(cooling[-1]["resistance_ohm"])
+        self.assertGreater(settled, 30.0 * 1.08)                       # new cold R
+        self.assertLess(float(cooling[0]["resistance_ohm"]) - settled, 5.0)
+        self.assertGreater(float(cooling[0]["resistance_ohm"]), settled * 1.02)
+
+    def test_timeout_moves_on_and_optional_abort(self):
+        end = {"type": "rref", "t_min_s": 0.1, "tol_pct": 0.5, "k_samples": 5}
+        profile = [(2.0, 0.3), cool(0.5, end), (2.0, 0.2), cool(0.5, end), (2.0, 0.2)]
+        smu, rows, error = self.run_mode(
+            "voltage", profile, self.LIMITS, smu=self.smu(training=1.0),
+            PROBE=PROBE, MANUAL_R_REF=30.0)
+        self.assertIsNone(error)                                   # option off: continue
+        for step in (2, 4):
+            last = step_rows(rows, step)[-1]
+            self.assertEqual(last["cooling_end_reason"], "timeout")
+            self.assertEqual(float(last["cooling_duration_s"]), 0.5)
+            self.assertGreaterEqual(float(last["step_elapsed_s"]), 0.45)
+        self.assertEqual(rows[-1]["step_index"], "5")
+
+        smu, rows, error = self.run_mode(
+            "voltage", profile, self.LIMITS, smu=self.smu(training=1.0), name="abort.csv",
+            PROBE=PROBE, MANUAL_R_REF=30.0, COOLING_TIMEOUT_ABORT=2)
+        self.assertIsInstance(error, control_modes.SafetyAbort)
+        self.assertIn("타임아웃 2회", rows[-1]["abort_reason"])
+        self.assertEqual(rows[-1]["step_index"], "4")
+        self.assertEqual(rows[-1]["cooling_end_reason"], "timeout")
+        self.assertFalse(smu._output_enabled)
+
+    def test_invalid_conditional_steps_refused_before_start(self):
+        rref = {"type": "rref"}
+        for profile, probe, r_ref, message in (
+                ([(2.0, 40.0, 1, "", {"end": rref})], PROBE, 30.0, "값이 0인 단계"),
+                ([cool(40.0, rref)], None, 30.0, "측정 전류가 켜져"),
+                ([cool(40.0, rref)], PROBE, None, "R_ref가 없습니다"),
+                ([cool(5.0, rref)], PROBE, 30.0, "t_min"),
+                ([cool(40.0, {"type": "magic"})], PROBE, 30.0, "알 수 없는")):
+            smu = recorder.DummySourceMeasureUnit()
+            with self.subTest(message=message), patch.multiple(
+                    recorder, CONTROL_MODE="voltage", PROFILE=profile,
+                    SAFETY_LIMITS=VOLTAGE_LIMITS, PROBE=probe, MANUAL_R_REF=r_ref,
+                    use_serial_marker=False, CURRENT_LIMIT=0.16):
+                with self.assertRaisesRegex(ValueError, message):
+                    recorder.run_profile(smu, Path(self.temp.name) / "never.csv")
+                self.assertFalse(smu._connected)
+
+
 class ProfileStoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
