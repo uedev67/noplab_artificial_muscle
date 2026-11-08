@@ -918,6 +918,76 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertEqual(len(errors), 2)
         self.assertTrue(all(s["builtin"] for s in summaries))
 
+    V1_PROFILE = {
+        "format_version": 1, "name": "옛 형식", "mode": "power", "value_unit": "W",
+        "steps": [{"value": 0.0, "duration_s": 5.0, "note": "초기"},
+                  {"value": 0.5, "duration_s": 10.0, "note": "가열"}],
+        "limits": {"power": {"I_lim": 0.16, "P_max": 1.5, "V_max": 12.0},
+                   "common": {"R_jump_pct": 5.0},
+                   "power_control": {"probe_V": 0.1, "max_step_V": 1.0, "max_R_failures": 3}},
+        "description": "v1", "created_at": "2026-11-08T11:29:07+09:00",
+        "updated_at": "2026-11-08T11:29:07+09:00"}
+
+    def test_format_version_1_profiles_load_with_defaults(self):
+        self.dir.mkdir()
+        path = self.dir / "옛 형식.json"
+        path.write_text(json.dumps(self.V1_PROFILE, ensure_ascii=False), encoding="utf-8")
+        loaded = profile_store.load_profile(path)
+        self.assertEqual(loaded["steps"], self.V1_PROFILE["steps"])     # no options added
+        self.assertEqual(loaded["limits"], self.V1_PROFILE["limits"])
+        self.assertEqual(loaded["probe"], control_modes.DEFAULT_PROBE)
+        self.assertFalse(loaded["probe"]["enabled"])
+        self.assertEqual(loaded["R_ref"], {"manual_ohm": None})
+        self.assertEqual(loaded["cooling"], control_modes.DEFAULT_COOLING)
+        # Profiles shipped in the repository (v1) still load.
+        for shipped in sorted(profile_store.PROFILE_DIR.glob("*.json")):
+            with self.subTest(shipped=shipped.name):
+                self.assertTrue(profile_store.load_profile(shipped)["steps"])
+        future = dict(self.V1_PROFILE, format_version=3)
+        with self.assertRaisesRegex(ValueError, "형식 버전"):
+            profile_store.normalize_profile(future)
+
+    def test_version_2_round_trip_with_step_options(self):
+        data = {"name": "v2", "mode": "power",
+                "steps": [{"value": 0, "duration_s": 5, "note": "idle"},
+                          {"value": 0, "duration_s": 30, "note": "R_ref measure",
+                           "kind": "rref", "rref": {"t_on_s": 5, "t_off_s": 5, "repeats": 3}},
+                          {"value": 0.3, "duration_s": 8, "note": "ref 0.3W #1 heat"},
+                          {"value": 0, "duration_s": 40, "note": "ref 0.3W #1 cool",
+                           "end": {"type": "rref"}},
+                          {"value": 0, "duration_s": 40, "note": "slope",
+                           "end": {"type": "slope", "window_s": 3}},
+                          {"value": 0, "duration_s": 15, "note": "fixed",
+                           "end": {"type": "fixed"}}],
+                "limits": {"power": {"I_lim": 0.25, "P_max": 1.1, "V_max": 6.0}},
+                "probe": {"enabled": True, "I_probe_A": 0.002},
+                "R_ref": {"manual_ohm": 29.5},
+                "cooling": {"timeout_abort": True, "timeout_abort_count": 3}}
+        path = profile_store.save_profile(data, self.dir)
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["format_version"], 2)
+        loaded = profile_store.load_profile(path)
+        steps = loaded["steps"]
+        self.assertEqual(steps[0], {"value": 0.0, "duration_s": 5.0, "note": "idle"})
+        self.assertEqual(steps[1]["kind"], "rref")
+        self.assertEqual(steps[1]["rref"], {"t_on_s": 5.0, "t_off_s": 5.0, "repeats": 3})
+        self.assertEqual(steps[3]["end"], {"type": "rref", "t_min_s": 10.0, "tol_pct": 0.5,
+                                           "k_samples": 5})
+        self.assertEqual(steps[4]["end"]["window_s"], 3.0)
+        self.assertEqual(steps[4]["end"]["slope_pct_per_s"], 0.05)
+        self.assertNotIn("end", steps[5])                                 # fixed = no key
+        self.assertEqual(loaded["probe"], {"enabled": True, "I_probe_A": 0.002,
+                                           "V_probe_max_V": 0.2, "R_jump_skip_samples": 2})
+        self.assertEqual(loaded["R_ref"], {"manual_ohm": 29.5})
+        self.assertEqual(loaded["cooling"], {"timeout_abort": True, "timeout_abort_count": 3})
+        summary = next(s for s in profile_store.list_profiles(self.dir)[0] if s["name"] == "v2")
+        self.assertEqual(summary["total_s"], 138.0)
+        self.assertEqual(summary["total_min_s"], 78.0)
+        bad = dict(data, name="bad", steps=[{"value": 0, "duration_s": 40,
+                                             "end": {"type": "rref", "k_samples": 0}}])
+        with self.assertRaisesRegex(ValueError, "1단계"):
+            profile_store.save_profile(bad, self.dir)
+
     def test_last_settings(self):
         path = Path(self.temp.name) / "settings" / "last_settings.json"
         self.assertEqual(profile_store.load_last_settings(path), {})
