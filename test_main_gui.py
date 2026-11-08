@@ -656,6 +656,36 @@ class DriverTests(unittest.TestCase):
         hot = smu.measure().resistance
         self.assertGreater(hot, cold * 1.1)
 
+    def test_dummy_cools_down_over_time_at_zero_output(self):
+        smu = recorder.DummySourceMeasureUnit(noise_ratio=0.0, time_constant_s=0.05)
+        smu.connect()
+        smu.temperature_rise = 50.0          # hot sample
+        smu.set_voltage(0.01)                # ~0.1 mA probe: negligible heating
+        smu.output_on()
+        hot = smu.measure().resistance
+        time.sleep(0.3)
+        cold = smu.measure().resistance
+        self.assertGreater(hot, 100.0 * 1.2)
+        self.assertAlmostEqual(cold, 100.0, delta=0.5)
+
+    def test_dummy_training_raises_cold_resistance_permanently(self):
+        smu = recorder.DummySourceMeasureUnit(noise_ratio=0.0, time_constant_s=0.02,
+                                              training_gain_per_w=0.2)
+        smu.connect()
+        smu.output_on()
+        for volts in (5.0, 0.0, 5.0, 0.0):   # same peak power twice
+            smu.set_voltage(volts)
+            time.sleep(0.15)
+            smu.measure()
+        first = smu.base_resistance
+        self.assertGreater(first, 100.0)     # new maximum -> permanent rise
+        smu.set_voltage(3.0)                 # lower power: no further training
+        time.sleep(0.1)
+        smu.measure()
+        self.assertEqual(smu.base_resistance, first)
+        default = recorder.DummySourceMeasureUnit()
+        self.assertEqual(default.training_gain, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
