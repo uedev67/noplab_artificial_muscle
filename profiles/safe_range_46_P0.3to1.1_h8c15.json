@@ -1,0 +1,371 @@
+{
+  "format_version": 1,
+  "name": "safe_range_46_P0.3to1.1_h8c15",
+  "mode": "power",
+  "value_unit": "W",
+  "steps": [
+    {
+      "value": 0.0,
+      "duration_s": 5.0,
+      "note": "start marker 0W"
+    },
+    {
+      "value": 0.3,
+      "duration_s": 8.0,
+      "note": "ref 0.3W heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "ref 0.3W cool"
+    },
+    {
+      "value": 0.3,
+      "duration_s": 8.0,
+      "note": "ref 0.3W heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "ref 0.3W cool"
+    },
+    {
+      "value": 0.4,
+      "duration_s": 8.0,
+      "note": "test 0.4W #1 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.4W #1 cool"
+    },
+    {
+      "value": 0.4,
+      "duration_s": 8.0,
+      "note": "test 0.4W #2 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.4W #2 cool"
+    },
+    {
+      "value": 0.4,
+      "duration_s": 8.0,
+      "note": "test 0.4W #3 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.4W #3 cool"
+    },
+    {
+      "value": 0.3,
+      "duration_s": 8.0,
+      "note": "ref 0.3W heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "ref 0.3W cool"
+    },
+    {
+      "value": 0.5,
+      "duration_s": 8.0,
+      "note": "test 0.5W #1 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.5W #1 cool"
+    },
+    {
+      "value": 0.5,
+      "duration_s": 8.0,
+      "note": "test 0.5W #2 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.5W #2 cool"
+    },
+    {
+      "value": 0.5,
+      "duration_s": 8.0,
+      "note": "test 0.5W #3 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.5W #3 cool"
+    },
+    {
+      "value": 0.3,
+      "duration_s": 8.0,
+      "note": "ref 0.3W heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "ref 0.3W cool"
+    },
+    {
+      "value": 0.6,
+      "duration_s": 8.0,
+      "note": "test 0.6W #1 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.6W #1 cool"
+    },
+    {
+      "value": 0.6,
+      "duration_s": 8.0,
+      "note": "test 0.6W #2 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.6W #2 cool"
+    },
+    {
+      "value": 0.6,
+      "duration_s": 8.0,
+      "note": "test 0.6W #3 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.6W #3 cool"
+    },
+    {
+      "value": 0.3,
+      "duration_s": 8.0,
+      "note": "ref 0.3W heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "ref 0.3W cool"
+    },
+    {
+      "value": 0.7,
+      "duration_s": 8.0,
+      "note": "test 0.7W #1 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.7W #1 cool"
+    },
+    {
+      "value": 0.7,
+      "duration_s": 8.0,
+      "note": "test 0.7W #2 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.7W #2 cool"
+    },
+    {
+      "value": 0.7,
+      "duration_s": 8.0,
+      "note": "test 0.7W #3 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.7W #3 cool"
+    },
+    {
+      "value": 0.3,
+      "duration_s": 8.0,
+      "note": "ref 0.3W heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "ref 0.3W cool"
+    },
+    {
+      "value": 0.8,
+      "duration_s": 8.0,
+      "note": "test 0.8W #1 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.8W #1 cool"
+    },
+    {
+      "value": 0.8,
+      "duration_s": 8.0,
+      "note": "test 0.8W #2 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.8W #2 cool"
+    },
+    {
+      "value": 0.8,
+      "duration_s": 8.0,
+      "note": "test 0.8W #3 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.8W #3 cool"
+    },
+    {
+      "value": 0.3,
+      "duration_s": 8.0,
+      "note": "ref 0.3W heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "ref 0.3W cool"
+    },
+    {
+      "value": 0.9,
+      "duration_s": 8.0,
+      "note": "test 0.9W #1 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.9W #1 cool"
+    },
+    {
+      "value": 0.9,
+      "duration_s": 8.0,
+      "note": "test 0.9W #2 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.9W #2 cool"
+    },
+    {
+      "value": 0.9,
+      "duration_s": 8.0,
+      "note": "test 0.9W #3 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 0.9W #3 cool"
+    },
+    {
+      "value": 0.3,
+      "duration_s": 8.0,
+      "note": "ref 0.3W heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "ref 0.3W cool"
+    },
+    {
+      "value": 1.0,
+      "duration_s": 8.0,
+      "note": "test 1W #1 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 1W #1 cool"
+    },
+    {
+      "value": 1.0,
+      "duration_s": 8.0,
+      "note": "test 1W #2 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 1W #2 cool"
+    },
+    {
+      "value": 1.0,
+      "duration_s": 8.0,
+      "note": "test 1W #3 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 1W #3 cool"
+    },
+    {
+      "value": 0.3,
+      "duration_s": 8.0,
+      "note": "ref 0.3W heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "ref 0.3W cool"
+    },
+    {
+      "value": 1.1,
+      "duration_s": 8.0,
+      "note": "test 1.1W #1 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 1.1W #1 cool"
+    },
+    {
+      "value": 1.1,
+      "duration_s": 8.0,
+      "note": "test 1.1W #2 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 1.1W #2 cool"
+    },
+    {
+      "value": 1.1,
+      "duration_s": 8.0,
+      "note": "test 1.1W #3 heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "test 1.1W #3 cool"
+    },
+    {
+      "value": 0.3,
+      "duration_s": 8.0,
+      "note": "ref 0.3W heat"
+    },
+    {
+      "value": 0.0,
+      "duration_s": 15.0,
+      "note": "ref 0.3W cool"
+    }
+  ],
+  "limits": {
+    "power": {
+      "I_lim": 0.25,
+      "P_max": 1.1,
+      "V_max": 6.0
+    },
+    "common": {
+      "R_jump_pct": 10.0
+    },
+    "power_control": {
+      "probe_V": 0.1,
+      "max_step_V": 1.0,
+      "max_R_failures": 3.0
+    }
+  },
+  "description": "전력 모드 safe range: 0W 5s(시작 마커) → ref 0.3W ×2 → [0.4~1.1W +0.1W: test ×3 → ref ×1], 가열 8s / 냉각 15s",
+  "created_at": "2026-11-08T15:13:03+09:00",
+  "updated_at": "2026-11-08T15:13:03+09:00"
+}
