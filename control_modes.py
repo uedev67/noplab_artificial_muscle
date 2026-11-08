@@ -702,3 +702,28 @@ def normalize_rref_step(spec) -> dict:
 
 def rref_step_duration(spec: dict) -> float:
     return float(f"{spec['repeats'] * (spec['t_on_s'] + spec['t_off_s']):.12g}")
+
+
+def rref_segment(spec: dict, elapsed: float) -> tuple[int, bool, float]:
+    """(segment index, probe on?, time since the segment's on-start)."""
+    cycle = spec["t_on_s"] + spec["t_off_s"]
+    index = min(int(elapsed // cycle), spec["repeats"] - 1)
+    within = elapsed - index * cycle
+    return index, within < spec["t_on_s"], within
+
+
+def rref_from_segments(segments, t_on: float, window_s: float = RREF_AVERAGE_S):
+    """Mean over on-segments of the mean R in each segment's last *window_s*.
+
+    *segments* = [[(time since on-start, R), ...], ...] (valid samples only).
+    Returns None when no segment has a sample in its averaging window.
+    """
+    start = max(0.0, t_on - window_s)
+    means = []
+    for samples in segments:
+        values = [r for t, r in samples if t >= start]
+        if values:
+            means.append(sum(values) / len(values))
+    if not means:
+        return None
+    return sum(means) / len(means)

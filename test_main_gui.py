@@ -365,13 +365,16 @@ class RecorderTestBase(unittest.TestCase):
         smu = smu or recorder.DummySourceMeasureUnit(current_limit=0.16)
         path = Path(self.temp.name) / name
         settings.setdefault("PROBE", None)
+        settings.setdefault("MANUAL_R_REF", None)
+        settings.setdefault("COOLING_TIMEOUT_ABORT", None)
+        on_event = settings.pop("on_event", None)
         with patch.multiple(recorder, CONTROL_MODE=mode, PROFILE=profile,
                             SAFETY_LIMITS=limits, use_serial_marker=False,
                             SAMPLE_INTERVAL_S=0.02, CURRENT_LIMIT=0.16,
                             VOLTAGE_LIMIT=12.0, **settings), \
                 redirect_stdout(io.StringIO()):
             try:
-                recorder.run_profile(smu, path)
+                recorder.run_profile(smu, path, on_event=on_event)
                 error = None
             except control_modes.SafetyAbort as exc:
                 error = exc
@@ -764,6 +767,96 @@ class ConditionalCoolingTests(RecorderTestBase):
                 with self.assertRaisesRegex(ValueError, message):
                     recorder.run_profile(smu, Path(self.temp.name) / "never.csv")
                 self.assertFalse(smu._connected)
+
+
+class RrefStepTests(RecorderTestBase):
+    """R_ref measurement step (R_ref 측정 단계)."""
+
+    SPEC = {"t_on_s": 0.4, "t_off_s": 0.2, "repeats": 2}
+
+    def rref_step(self, spec=None):
+        spec = spec or self.SPEC
+        duration = spec["repeats"] * (spec["t_on_s"] + spec["t_off_s"])
+        return (0.0, duration, 1, "R_ref measure", {"kind": "rref", "rref": spec})
+
+    def test_average_of_last_window_of_each_on_segment(self):
+        segments = [[(1.0, 100.0), (2.5, 31.0), (3.0, 30.0), (4.0, 30.0), (4.9, 30.0)],
+                    [(2.1, 29.0), (4.0, 31.0)],
+                    [(0.5, 50.0)],          # nothing in its last 3 s -> ignored
+                    []]
+        self.assertAlmostEqual(control_modes.rref_from_segments(segments, 5.0), 30.125)
+        self.assertAlmostEqual(control_modes.rref_from_segments([[(0.1, 20.0), (1.0, 22.0)]],
+                                                                2.0), 21.0)  # t_on < 3 s
+        self.assertIsNone(control_modes.rref_from_segments([[], []], 5.0))
+        self.assertEqual(control_modes.rref_segment(self.SPEC, 0.1)[:2], (0, True))
+        self.assertEqual(control_modes.rref_segment(self.SPEC, 0.5)[:2], (0, False))
+        self.assertEqual(control_modes.rref_segment(self.SPEC, 0.7)[:2], (1, True))
+        self.assertEqual(control_modes.rref_segment(self.SPEC, 9.0)[:2], (1, False))
+
+    def test_rref_step_in_every_mode_feeds_r_ref_condition(self):
+        end = {"type": "rref", "t_min_s": 0.1, "tol_pct": 1.0, "k_samples": 3}
+        heat = {"voltage": (2.0, VOLTAGE_LIMITS), "current": (0.05, CURRENT_LIMITS),
+                "power": (0.15, POWER_LIMITS)}
+        for mode, (value, limits) in heat.items():
+            smu = recorder.DummySourceMeasureUnit(base_resistance=30.0, current_limit=0.16,
+                                                  noise_ratio=0.0005, time_constant_s=0.1)
+            events = []
+            with self.subTest(mode=mode):
+                smu, rows, error = self.run_mode(
+                    mode, [self.rref_step(), (value, 0.3), cool(5.0, end)],
+                    dict(limits, R_jump_pct=20.0), smu=smu, name=f"rref_{mode}.csv",
+                    PROBE=PROBE, MANUAL_R_REF=99.0,
+                    on_event=lambda kind, v: events.append((kind, v)))
+                self.assertIsNone(error)
+                rref_rows = step_rows(rows, 1)
+                self.assertEqual({r["phase"] for r in rref_rows}, {"rref"})
+                self.assertEqual({float(r["R_ref_ohm"]) for r in rref_rows}, {99.0})
+                segments = {}
+                for row in rref_rows:
+                    elapsed = float(row["step_elapsed_s"])
+                    within = elapsed % 0.6
+                    # Segment is chosen at loop start; step_elapsed_s is the
+                    # measurement time (up to one sample later) -> margins.
+                    if 0.05 < within < 0.37 and elapsed < 1.18:
+                        self.assertEqual(row["probe_active"], "1", elapsed)
+                    if 0.45 < within < 0.58:
+                        self.assertEqual(row["probe_active"], "0", elapsed)
+                        self.assertAlmostEqual(float(row["current_A"]), 0.0, delta=1e-6)
+                    if row["probe_active"] == "1":
+                        if mode != "current":
+                            self.assertLessEqual(float(row["command_voltage_V"]), 0.2)
+                        segments.setdefault(int(elapsed // 0.6), []).append(
+                            float(row["resistance_ohm"]))
+                self.assertEqual(sorted(segments), [0, 1])
+                expected = sum(sum(v) / len(v) for v in segments.values()) / 2
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0][0], "R_ref")
+                self.assertAlmostEqual(events[0][1], expected, places=9)
+                self.assertAlmostEqual(expected, 30.0, delta=0.2)
+                for row in rows[len(rref_rows):]:
+                    self.assertAlmostEqual(float(row["R_ref_ohm"]), expected, places=9)
+                self.assertEqual(step_rows(rows, 3)[-1]["cooling_end_reason"], "condition")
+
+    def test_rref_step_without_valid_resistance_fails_safely(self):
+        smu = recorder.DummySourceMeasureUnit(current_limit=0.16)
+        smu.measure = lambda: driver.Measurement(0.0, 0.0, float("inf"))
+        with self.assertRaisesRegex(RuntimeError, "R_ref 측정 실패"):
+            self.run_mode("voltage", [self.rref_step()], VOLTAGE_LIMITS,
+                          smu=smu, PROBE=dict(PROBE, enabled=False))
+        self.assertFalse(smu._output_enabled)
+        self.assertFalse(smu._connected)
+
+    def test_rref_step_validation(self):
+        for profile, probe, message in (
+                ([self.rref_step()], None, "측정 전류 설정이 필요"),
+                ([(0.0, 5.0, 1, "", {"kind": "rref", "rref": self.SPEC})], PROBE, "≠"),
+                ([(1.0, 1.2, 1, "", {"kind": "rref", "rref": self.SPEC})], PROBE, "값은 0")):
+            with self.subTest(message=message), patch.multiple(
+                    recorder, CONTROL_MODE="voltage", PROFILE=profile,
+                    SAFETY_LIMITS=VOLTAGE_LIMITS, PROBE=probe, MANUAL_R_REF=None,
+                    use_serial_marker=False, CURRENT_LIMIT=0.16):
+                with self.assertRaisesRegex(ValueError, message):
+                    recorder.validate_settings()
 
 
 class ProfileStoreTests(unittest.TestCase):

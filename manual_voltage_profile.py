@@ -52,6 +52,8 @@ from control_modes import (
     SafetyMonitor,
     normalize_probe,
     normalize_step_options,
+    rref_from_segments,
+    rref_segment,
     profile_violations,
     resistance_is_valid,
     validate_limits,
@@ -731,8 +733,12 @@ def run_profile(
     output_path: Path,
     stop_event: Event | None = None,
     exclusive_output: bool = False,
+    on_event=None,
 ) -> None:
     """Run PROFILE in CONTROL_MODE and log every sample to *output_path*.
+
+    *on_event(kind, value)* (optional) is called with ("R_ref", ohm) when an
+    R_ref measurement step has computed R_ref.
 
     Raises SafetyAbort (after output 0 + OFF and a CSV row with
     ``abort_reason``) when a software limit in SAFETY_LIMITS is exceeded.
@@ -965,8 +971,9 @@ def run_profile(
 
             options = profile_entry_options(entry)
 
-            if options.get("kind") == "rref":
-                raise NotImplementedError("R_ref measurement step")
+            rref_spec = (
+                options["rref"] if options.get("kind") == "rref" else None
+            )
 
             end_spec = options.get("end")
 
@@ -989,6 +996,8 @@ def run_profile(
             #   zero  : value == 0, true 0 output (original behaviour)
             if set_value != 0.0:
                 regime = "heat"
+            elif rref_spec is not None:
+                regime = "probe"   # R_ref step starts with an on-segment
             elif probe_enabled:
                 regime = "probe"
             else:
@@ -996,6 +1005,8 @@ def run_profile(
 
             if regime == "heat":
                 phase = "heating"
+            elif rref_spec is not None:
+                phase = "rref"
             elif seen_heating:
                 phase = "cooling"
             else:
@@ -1019,14 +1030,21 @@ def run_profile(
 
             previous_was_heating = regime == "heat"
 
+            # The R_ref step uses the probe settings even with PROBE disabled.
+            step_skip_samples = (
+                probe["R_jump_skip_samples"]
+                if rref_spec is not None
+                else jump_skip_samples
+            )
+
             if (
                 monitor is not None
-                and jump_skip_samples
+                and step_skip_samples
                 and previous_regime is not None
                 and regime != previous_regime
             ):
                 # Auto range may switch between heating and probe current.
-                monitor.skip_jump_check(jump_skip_samples)
+                monitor.skip_jump_check(step_skip_samples)
 
             previous_regime = regime
 
@@ -1036,6 +1054,13 @@ def run_profile(
 
 
             print(f"Step {step_index}/{len(PROFILE)}")
+
+            if rref_spec is not None:
+                print(
+                    f"  R_ref    : probe {probe['I_probe_A'] * 1e3:.4g} mA "
+                    f"on {rref_spec['t_on_s']:g} s / off {rref_spec['t_off_s']:g} s "
+                    f"x{rref_spec['repeats']}"
+                )
 
             if mode == "voltage":
                 print(f"  Vset     : {set_value:.6g} V")
@@ -1160,6 +1185,10 @@ def run_profile(
 
             step_previous_power: float | None = None
 
+            # R_ref step: valid (time since on-start, R) per on-segment
+            rref_segments: list[list[tuple[float, float]]] = []
+            rref_index = -1
+
 
             # =================================================================
             # Sampling loop
@@ -1170,6 +1199,55 @@ def run_profile(
                     return
 
                 loop_start = time.monotonic()
+
+                if rref_spec is not None:
+
+                    index, probe_on, within = rref_segment(
+                        rref_spec, loop_start - step_start
+                    )
+
+                    if probe_on and index != rref_index:
+                        rref_index = index
+                        rref_segments.append([])
+
+                    wanted = "probe" if probe_on else "zero"
+
+                    if wanted != regime:
+
+                        regime = wanted
+
+                        if monitor is not None and step_skip_samples:
+                            monitor.skip_jump_check(step_skip_samples)
+
+                        previous_regime = regime
+
+                        if probe_on:
+
+                            if voltage_source:
+                                command_voltage = probe_controller.start(
+                                    last_valid_resistance
+                                )
+                                smu.set_voltage(command_voltage)
+                            else:
+                                smu.set_current(probe["I_probe_A"])
+
+                        elif voltage_source:
+
+                            command_voltage = 0.0
+                            smu.set_voltage(0.0)
+
+                        else:
+
+                            smu.set_current(0.0)
+
+                        if power_controller is not None:
+                            power_controller.command = (
+                                command_voltage if probe_on else 0.0
+                            )
+
+                    probe_v_max = (
+                        probe["V_probe_max_V"] if probe_on else None
+                    )
 
                 # The step ends after the sample that is decided to be its
                 # last one (see "Step end decision" below), so the last row
@@ -1227,6 +1305,16 @@ def run_profile(
 
                     if regime != "heat":
                         cold_samples.append((measure_end, measured.resistance))
+
+                    if rref_spec is not None and regime == "probe":
+                        rref_segments[-1].append(
+                            (
+                                measure_end - step_start
+                                - rref_index
+                                * (rref_spec["t_on_s"] + rref_spec["t_off_s"]),
+                                measured.resistance,
+                            )
+                        )
 
 
                 # -------------------------------------------------------------
@@ -1656,6 +1744,34 @@ def run_profile(
 
                 if last_sample:
                     break
+
+
+            # -----------------------------------------------------------------
+            # R_ref step result
+            # -----------------------------------------------------------------
+
+            if rref_spec is not None:
+
+                measured_r_ref = rref_from_segments(
+                    rref_segments, rref_spec["t_on_s"]
+                )
+
+                if measured_r_ref is None:
+                    raise RuntimeError(
+                        f"R_ref 측정 실패 (step {step_index}): "
+                        "on 구간에서 유효한 저항을 얻지 못했습니다."
+                    )
+
+                r_ref_value = measured_r_ref
+
+                print(
+                    f"R_ref measured: {r_ref_value:.6g} ohm "
+                    f"(mean of {len(rref_segments)} on-segments, "
+                    f"last {min(rref_spec['t_on_s'], 3.0):g} s each)"
+                )
+
+                if on_event is not None:
+                    on_event("R_ref", r_ref_value)
 
 
             previous_set_value = (
