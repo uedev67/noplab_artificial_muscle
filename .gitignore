@@ -15,3 +15,6 @@ Thumbs.db
 # 실험 실행 중 생성되는 데이터와 그래프
 data/
 *.log
+
+# 로컬 전용 GUI 설정 (마지막 안전 상한 등)
+settings/

@@ -1,17 +1,23 @@
 """Hardware-free checks: python -m unittest test_main_gui -v."""
 
 import csv
+import io
+import json
 import tempfile
 import threading
 import time
 import tkinter as tk
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import control_modes
+import keithley_driver as driver
 import main_gui
 import manual_voltage_profile as recorder
+import profile_store
 
 
 class GUIIntegrationTests(unittest.TestCase):
@@ -19,7 +25,10 @@ class GUIIntegrationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = tk.Tk()
         self.root.withdraw()
-        self.gui = main_gui.ExperimentGUI(self.root)
+        self.profile_dir = Path(self.temp.name) / "profiles"
+        self.settings_path = Path(self.temp.name) / "settings" / "last_settings.json"
+        self.gui = main_gui.ExperimentGUI(self.root, profile_dir=self.profile_dir,
+                                          settings_path=self.settings_path)
         for item in list(self.gui.rows):
             self.gui.remove_row(item)
         self.gui.add_row(2, 0.03, "test")
@@ -30,6 +39,8 @@ class GUIIntegrationTests(unittest.TestCase):
         self.gui.dummy.set(True)
 
     def tearDown(self):
+        for after_id in self.root.tk.splitlist(self.root.tk.call("after", "info")):
+            self.root.tk.call("after", "cancel", after_id)
         self.root.destroy()
         self.temp.cleanup()
 
@@ -43,7 +54,11 @@ class GUIIntegrationTests(unittest.TestCase):
         with path.open(encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
         self.assertTrue(rows)
-        self.assertEqual(set(rows[0]), set(recorder.FIELDNAMES))
+        self.assertEqual(list(rows[0]), recorder.FIELDNAMES)
+        self.assertEqual({r["control_mode"] for r in rows}, {"voltage"})
+        self.assertEqual(float(rows[0]["current_limit_A"]), 0.16)  # GUI I_lim default
+        self.assertIs(recorder.SAFETY_LIMITS, None)  # CLI default restored
+        self.assertEqual(recorder.CONTROL_MODE, "voltage")
         self.assertEqual({r["sample_id"] for r in rows}, {"22"})
         self.assertEqual({r["cycle_index"] for r in rows}, {"5"})
         self.assertEqual({r["step_index"] for r in rows}, {"1", "2"})
@@ -52,11 +67,13 @@ class GUIIntegrationTests(unittest.TestCase):
             self.gui.collect_settings()
 
     def test_validation(self):
-        for bad in ("nan", "inf", "0", "-1"):
-            self.gui.variables["CURRENT_LIMIT"].set(bad)
+        i_lim = self.gui.limit_vars["voltage"]["I_lim"]
+        for bad in ("nan", "inf", "0", "-1", "abc", "1.2"):
+            i_lim.set(bad)
             with self.assertRaises(ValueError):
                 self.gui.collect_settings()
-        self.gui.variables["CURRENT_LIMIT"].set("0.35")
+        i_lim.set("0.35")
+        self.gui.collect_settings()
         self.gui.rows[0][0][1].set("0")
         with self.assertRaises(ValueError):
             self.gui.collect_settings()
@@ -101,6 +118,543 @@ class GUIIntegrationTests(unittest.TestCase):
             self.assertEqual(smu._voltage, 0)
             with path.open(encoding="utf-8-sig") as handle:
                 self.assertEqual(len(list(csv.DictReader(handle))), 0 if fail else 1)
+
+    # ------------------------------------------------------------------
+    # Control modes
+    # ------------------------------------------------------------------
+
+    def visible_limit_groups(self):
+        return {group for group, frame in self.gui.limit_frames.items()
+                if frame.winfo_manager() == "grid"}
+
+    def test_mode_switch_changes_header_unit_and_limit_panel(self):
+        self.assertEqual(self.gui.value_header.cget("text"), "전압 (V)")
+        self.assertEqual(self.visible_limit_groups(), {"voltage", "common"})
+        with patch.object(self.gui, "ask_mode_change", return_value=None) as ask:
+            self.assertFalse(self.gui.set_mode("power"))
+        ask.assert_called_once_with("voltage", "power")
+        self.assertEqual(self.gui.mode, "voltage")
+        with patch.object(self.gui, "ask_mode_change", return_value="keep"):
+            self.assertTrue(self.gui.set_mode("power"))
+        self.assertEqual(self.gui.value_header.cget("text"), "전력 (W)")
+        self.assertEqual(self.visible_limit_groups(), {"power", "common", "power_control"})
+        self.assertEqual(len(self.gui.rows), 2)
+        self.assertIn("수정됨", self.gui.profile_status.get())
+        with patch.object(self.gui, "ask_mode_change", return_value="clear"):
+            self.assertTrue(self.gui.set_mode("current"))
+        self.assertEqual(self.gui.value_header.cget("text"), "전류 (mA)")
+        self.assertEqual(self.visible_limit_groups(), {"current", "common"})
+        self.assertEqual(self.gui.rows, [])
+        self.assertEqual(self.gui.mode_var.get(), "current")
+        # No rows -> no question.
+        with patch.object(self.gui, "ask_mode_change") as ask:
+            self.assertTrue(self.gui.set_mode("voltage"))
+        ask.assert_not_called()
+
+    def test_running_locks_mode_buttons(self):
+        self.gui.set_running(True)
+        try:
+            for button in self.gui.mode_buttons.values():
+                self.assertEqual(str(button.cget("state")), "disabled")
+            self.assertFalse(self.gui.set_mode("power", ask=False))
+            self.assertEqual(self.gui.mode, "voltage")
+            for entry in (w for group in self.gui.limit_frames.values()
+                          for w in group.winfo_children() if isinstance(w, tk.ttk.Entry)):
+                self.assertIn("disabled", entry.state())
+        finally:
+            self.gui.set_running(False)
+        self.assertEqual(str(self.gui.mode_buttons["power"].cget("state")), "normal")
+
+    def test_start_blocked_when_profile_exceeds_limits(self):
+        self.gui.add_row(13, 0.03)          # row 3 > V_max 12 V
+        self.gui.add_row(12, 0.03)          # equal is allowed
+        with self.assertRaisesRegex(ValueError, "3행"):
+            self.gui.collect_settings()
+        with patch("main_gui.messagebox.showerror") as error, \
+                patch("main_gui.threading.Thread") as thread:
+            self.gui.start()
+        self.assertIn("3행", error.call_args[0][1])
+        self.assertNotIn("4행", error.call_args[0][1])
+        thread.assert_not_called()
+        self.assertFalse(self.gui.running)
+        # Current mode: GUI mA vs I_max (mA)
+        with patch.object(self.gui, "ask_mode_change", return_value="clear"):
+            self.gui.set_mode("current")
+        self.gui.add_row(160, 0.03)
+        self.gui.add_row(161, 0.03)
+        with self.assertRaisesRegex(ValueError, "2행: 설정 전류 161 mA > I_max 160 mA"):
+            self.gui.collect_settings()
+
+    def test_current_mode_run_from_gui(self):
+        with patch.object(self.gui, "ask_mode_change", return_value="clear"):
+            self.gui.set_mode("current")
+        self.gui.add_row(20, 0.05)
+        settings, path, dummy = self.gui.collect_settings()
+        self.assertEqual(settings["CONTROL_MODE"], "current")
+        self.assertEqual(settings["PROFILE"][0][0], 0.02)
+        self.assertEqual(settings["VOLTAGE_LIMIT"], 12.0)
+        self.gui.worker(settings, path, dummy)
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual({r["control_mode"] for r in rows}, {"current"})
+        self.assertEqual({r["set_voltage_V"] for r in rows}, {""})
+        self.assertEqual({float(r["set_current_A"]) for r in rows}, {0.02})
+
+    def test_gui_safety_abort_reports_and_records_reason(self):
+        self.gui.limit_vars["voltage"]["P_max"].set("0.01")   # 2 V / 100 ohm = 0.04 W
+        self.gui.rows[0][0][1].set("5")
+        settings, path, dummy = self.gui.collect_settings()
+        self.gui.worker(settings, path, dummy)
+        kind, text = self.gui.messages.queue[-1]
+        self.assertEqual(kind, "safety")
+        self.assertIn("측정 전력", text)
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(rows), 1)
+        self.assertIn("P_max", rows[0]["abort_reason"])
+        self.assertIs(recorder.SAFETY_LIMITS, None)
+        with patch("main_gui.messagebox.showerror") as error:
+            self.gui.running = True
+            self.gui.poll()
+        self.assertEqual(error.call_args[0][0], "안전 종료")
+        self.assertFalse(self.gui.running)
+
+    # ------------------------------------------------------------------
+    # Profiles
+    # ------------------------------------------------------------------
+
+    def test_profile_save_list_load_round_trip(self):
+        with patch.object(self.gui, "ask_mode_change", return_value="clear"):
+            self.gui.set_mode("current")
+        self.gui.add_row(20, 10, "가열")
+        self.gui.add_row(0, 30, "냉각")
+        self.gui.limit_vars["current"]["I_max"].set("100")
+        self.gui.limit_vars["common"]["R_jump_pct"].set("7")
+        self.gui.description.set("왕복 테스트 설명")
+        with patch.object(self.gui, "ask_profile_name", return_value="왕복/테스트"), \
+                patch("main_gui.messagebox.showerror") as error:
+            self.assertFalse(self.gui.save_profile_as())   # invalid file name
+        self.assertIn("'/'", error.call_args[0][1])
+        with patch.object(self.gui, "ask_profile_name", return_value="왕복 테스트"):
+            self.assertTrue(self.gui.save_profile_as())
+        self.assertFalse(self.gui.dirty)
+        self.assertIn("저장됨", self.gui.profile_status.get())
+        saved = json.loads((self.profile_dir / "왕복 테스트.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["mode"], "current")
+        self.assertEqual(saved["steps"][0], {"value": 0.02, "duration_s": 10.0, "note": "가열"})
+        self.assertEqual(saved["limits"]["current"]["I_max"], 0.1)
+        self.assertNotIn("voltage", saved["limits"])
+
+        # [저장] overwrites the current profile after confirmation.
+        self.gui.rows[1][0][1].set("40")
+        self.assertTrue(self.gui.dirty)
+        with patch("main_gui.messagebox.askyesno", return_value=False):
+            self.assertFalse(self.gui.save_profile())
+        with patch("main_gui.messagebox.askyesno", return_value=True):
+            self.assertTrue(self.gui.save_profile())
+
+        # Change everything, then load it back from the list.
+        with patch.object(self.gui, "ask_mode_change", return_value="clear"):
+            self.gui.set_mode("voltage")
+        self.gui.add_row(5, 1)
+        self.gui.limit_vars["current"]["I_max"].set("150")
+        self.gui.limit_vars["common"]["R_jump_pct"].set("5")
+        summaries, _ = profile_store.list_profiles(self.profile_dir)
+        summary = next(s for s in summaries if s["name"] == "왕복 테스트")
+        self.assertEqual((summary["mode"], summary["steps"], summary["total_s"]),
+                         ("current", 2, 50.0))
+        with patch("main_gui.messagebox.askyesno", return_value=False):
+            self.assertFalse(self.gui.load_profile_summary(summary))   # keep unsaved edits
+        self.assertEqual(self.gui.mode, "voltage")
+        with patch("main_gui.messagebox.askyesno", return_value=True):
+            self.assertTrue(self.gui.load_profile_summary(summary))
+        self.assertEqual(self.gui.mode, "current")
+        self.assertEqual(self.gui.mode_var.get(), "current")
+        self.assertEqual(self.gui.value_header.cget("text"), "전류 (mA)")
+        self.assertEqual([[v.get() for v in variables] for variables, _ in self.gui.rows],
+                         [["20", "10", "가열"], ["0", "40", "냉각"]])
+        self.assertEqual(self.gui.limit_vars["current"]["I_max"].get(), "100")
+        self.assertEqual(self.gui.limit_vars["common"]["R_jump_pct"].get(), "7")
+        self.assertEqual(self.gui.description.get(), "왕복 테스트 설명")
+        self.assertFalse(self.gui.dirty)
+        self.assertIn("왕복 테스트", self.gui.profile_status.get())
+
+        # Delete with confirmation.
+        with patch("main_gui.messagebox.askyesno", return_value=True):
+            self.assertTrue(self.gui.delete_profile())
+        self.assertFalse((self.profile_dir / "왕복 테스트.json").exists())
+        self.assertIsNone(self.gui.current_profile)
+
+    def test_builtin_profile_is_read_only(self):
+        summaries, _ = profile_store.list_profiles(self.profile_dir)
+        exp4 = next(s for s in summaries if s["builtin"] and s["name"] == "exp4")
+        with patch("main_gui.messagebox.askyesno", return_value=True):
+            self.assertTrue(self.gui.load_profile_summary(exp4))
+        self.assertEqual(self.gui.mode, "voltage")
+        self.assertEqual(len(self.gui.rows), len(recorder.PROFILES["exp4"]))
+        self.assertIn("[기본] exp4", self.gui.profile_status.get())
+        with patch("main_gui.messagebox.showinfo") as info:
+            self.assertFalse(self.gui.delete_profile())
+        info.assert_called_once()
+        # [저장] on a built-in becomes [다른 이름으로 저장].
+        with patch.object(self.gui, "ask_profile_name", return_value=None) as ask:
+            self.assertFalse(self.gui.save_profile())
+        ask.assert_called_once()
+
+    def test_profile_list_dialog_filter_and_search(self):
+        for name, mode in (("가열 전력", "power"), ("전류 시험", "current")):
+            profile_store.save_profile(
+                {"name": name, "mode": mode, "steps": [{"value": 0.1, "duration_s": 1}]},
+                self.profile_dir)
+        self.gui.open_profile_list()
+        dialog = self.gui.profile_list
+        names = lambda: [dialog.items[i]["name"] for i in dialog.tree.get_children()]
+        self.assertIn("exp4", names())
+        dialog.filter.set("전력")
+        self.assertEqual(names(), ["가열 전력"])
+        dialog.filter.set("전체")
+        dialog.search.set("시험")
+        self.assertEqual(names(), ["전류 시험"])
+        dialog.tree.selection_set(dialog.tree.get_children()[0])
+        with patch("main_gui.messagebox.askyesno", return_value=True):
+            dialog.load_selected()
+        self.assertEqual(self.gui.mode, "current")
+        self.assertEqual(self.gui.rows[0][0][0].get(), "100")   # 0.1 A -> 100 mA
+        self.assertFalse(dialog.window.winfo_exists())
+
+    def test_last_used_limits_are_restored(self):
+        self.gui.limit_vars["power"]["P_max"].set("0.8")
+        self.gui.limit_vars["power_control"]["max_R_failures"].set("5")
+        self.gui.save_last_settings()
+        other = main_gui.ExperimentGUI(tk.Toplevel(self.root), profile_dir=self.profile_dir,
+                                       settings_path=self.settings_path)
+        self.assertEqual(other.limit_vars["power"]["P_max"].get(), "0.8")
+        self.assertEqual(other.limit_vars["power_control"]["max_R_failures"].get(), "5")
+        self.assertEqual(other.mode, "voltage")
+        self.assertFalse(other.dirty)
+
+
+LEGACY_FIELDNAMES = [
+    "experiment_id", "sample_id", "operator", "sample_index",
+    "timestamp_local", "timestamp_utc", "time_s", "dt_s", "measurement_duration_s",
+    "step_index", "cycle_index", "state", "step_note", "step_elapsed_s",
+    "step_duration_s", "wire_mode", "set_voltage_V", "measured_voltage_V",
+    "voltage_error_V", "current_A", "current_limit_A", "current_limit_ratio",
+    "near_current_limit", "resistance_ohm", "conductance_S", "power_W",
+    "energy_J", "step_energy_J", "preload_g", "initial_length_mm",
+    "ambient_temp_C", "ir_camera_id", "sony_camera_id", "sync_note", "general_note",
+]
+
+POWER_LIMITS = {"P_max": 1.5, "V_max": 12.0, "R_jump_pct": 5.0,
+                "probe_V": 0.1, "max_step_V": 1.0, "max_R_failures": 3}
+VOLTAGE_LIMITS = {"V_max": 12.0, "P_max": 1.5, "R_jump_pct": 5.0}
+CURRENT_LIMITS = {"I_max": 0.16, "P_max": 1.5, "R_jump_pct": 5.0}
+
+
+class ControlModeRecorderTests(unittest.TestCase):
+    """run_profile() in each control mode with the dummy SMU (no hardware)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def run_mode(self, mode, profile, limits, smu=None, name="run.csv"):
+        smu = smu or recorder.DummySourceMeasureUnit(current_limit=0.16)
+        path = Path(self.temp.name) / name
+        with patch.multiple(recorder, CONTROL_MODE=mode, PROFILE=profile,
+                            SAFETY_LIMITS=limits, use_serial_marker=False,
+                            SAMPLE_INTERVAL_S=0.02, CURRENT_LIMIT=0.16,
+                            VOLTAGE_LIMIT=12.0), \
+                redirect_stdout(io.StringIO()):
+            try:
+                recorder.run_profile(smu, path)
+                error = None
+            except control_modes.SafetyAbort as exc:
+                error = exc
+        rows = []
+        if path.exists():
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        return smu, rows, error
+
+    def test_legacy_columns_keep_order_and_new_columns_are_appended(self):
+        self.assertEqual(recorder.FIELDNAMES[:len(LEGACY_FIELDNAMES)], LEGACY_FIELDNAMES)
+        self.assertEqual(recorder.FIELDNAMES[len(LEGACY_FIELDNAMES):], [
+            "control_mode", "set_value", "set_unit", "set_current_A",
+            "target_power_W", "command_voltage_V", "limit_settings", "abort_reason"])
+
+    def test_voltage_mode_legacy_values(self):
+        smu, rows, error = self.run_mode("voltage", [(2.0, 0.1)], None)
+        self.assertIsNone(error)
+        row = rows[0]
+        self.assertEqual(float(row["set_voltage_V"]), 2.0)
+        self.assertEqual(float(row["current_limit_A"]), 0.16)
+        self.assertEqual((row["control_mode"], row["set_unit"], row["abort_reason"]),
+                         ("voltage", "V", ""))
+        self.assertEqual(row["set_current_A"], "")
+        self.assertFalse(smu._output_enabled)
+
+    def test_power_mode_converges_within_3_percent(self):
+        smu, rows, error = self.run_mode(
+            "power", [(0.0, 0.2), (0.5, 2.0), (0.0, 0.2), (1.0, 1.5)], POWER_LIMITS)
+        self.assertIsNone(error)
+        for step, target in (("2", 0.5), ("4", 1.0)):
+            step_rows = [r for r in rows if r["step_index"] == step]
+            self.assertEqual(float(step_rows[0]["command_voltage_V"]), 0.1)  # probe
+            settled = step_rows[len(step_rows) // 2:]
+            self.assertGreater(len(settled), 10)
+            for row in settled:
+                self.assertAlmostEqual(float(row["power_W"]), target, delta=target * 0.03)
+                self.assertEqual(row["set_voltage_V"], row["command_voltage_V"])
+                self.assertEqual(float(row["target_power_W"]), target)
+                self.assertLessEqual(float(row["command_voltage_V"]), 12.0)
+        self.assertEqual(smu._source_function, "voltage")  # never switched
+        self.assertFalse(smu._output_enabled)
+        self.assertEqual(smu._voltage, 0)
+
+    def test_power_mode_rate_limits_increases_and_clamps_at_v_max(self):
+        limits = dict(POWER_LIMITS, V_max=3.0, P_max=1.5)
+        smu, rows, error = self.run_mode("power", [(1.0, 0.6)], limits)
+        self.assertIsNone(error)
+        commands = [float(r["command_voltage_V"]) for r in rows]
+        for before, after in zip(commands, commands[1:]):
+            self.assertLessEqual(after - before, 1.0 + 1e-9)
+        self.assertEqual(max(commands), 3.0)
+
+    def test_current_mode_csv(self):
+        smu, rows, error = self.run_mode("current", [(0.02, 0.2)], CURRENT_LIMITS)
+        self.assertIsNone(error)
+        row = rows[-1]
+        self.assertEqual(row["set_voltage_V"], "")
+        self.assertEqual(row["current_limit_A"], "")
+        self.assertEqual(float(row["set_current_A"]), 0.02)
+        self.assertEqual((row["control_mode"], row["set_unit"]), ("current", "A"))
+        self.assertAlmostEqual(float(row["current_A"]), 0.02, delta=0.001)
+        self.assertEqual(json.loads(row["limit_settings"])["V_lim"], 12.0)
+        self.assertEqual(smu._current, 0)
+        self.assertFalse(smu._output_enabled)
+
+    def test_runtime_limit_switches_output_off_and_records_reason(self):
+        for mode, profile, limits in (
+                ("voltage", [(2.0, 5.0)], dict(VOLTAGE_LIMITS, P_max=0.01)),
+                ("current", [(0.05, 5.0)], dict(CURRENT_LIMITS, P_max=0.1)),
+                ("power", [(0.5, 5.0)], dict(POWER_LIMITS, P_max=0.5,
+                                            probe_V=0.1))):
+            smu = recorder.DummySourceMeasureUnit(current_limit=1.0)
+            if mode == "power":
+                # Sample suddenly conducts much better -> power overshoot.
+                measure = smu.measure
+                calls = []
+
+                def measure_with_short(measure=measure, calls=calls, smu=smu):
+                    calls.append(1)
+                    if len(calls) == 15:
+                        smu.base_resistance = 20.0
+                    return measure()
+                smu.measure = measure_with_short
+                limits["R_jump_pct"] = 1000.0
+            with self.subTest(mode=mode):
+                start = time.monotonic()
+                smu, rows, error = self.run_mode(mode, profile, limits, smu=smu,
+                                                 name=f"abort_{mode}.csv")
+                self.assertLess(time.monotonic() - start, 3)
+                self.assertIsInstance(error, control_modes.SafetyAbort)
+                self.assertIn("측정 전력", rows[-1]["abort_reason"])
+                self.assertTrue(all(r["abort_reason"] == "" for r in rows[:-1]))
+                self.assertFalse(smu._output_enabled)
+                self.assertFalse(smu._connected)
+                self.assertEqual((smu._voltage, smu._current), (0, 0))
+
+    def test_resistance_jump_aborts(self):
+        smu = recorder.DummySourceMeasureUnit(current_limit=0.16)
+        measure = smu.measure
+        calls = []
+
+        def jumping():
+            calls.append(1)
+            if len(calls) == 5:
+                smu.base_resistance *= 1.2  # e.g. a contact starting to fail
+            return measure()
+        smu.measure = jumping
+        smu, rows, error = self.run_mode("voltage", [(1.0, 5.0)], VOLTAGE_LIMITS, smu=smu)
+        self.assertIsInstance(error, control_modes.SafetyAbort)
+        self.assertIn("저항 급변", rows[-1]["abort_reason"])
+        self.assertEqual(len(rows), 5)
+        self.assertFalse(smu._output_enabled)
+
+    def test_power_mode_aborts_after_repeated_invalid_resistance(self):
+        smu = recorder.DummySourceMeasureUnit(current_limit=0.16)
+        smu.measure = lambda: driver.Measurement(0.1, 0.0, float("inf"))
+        smu, rows, error = self.run_mode("power", [(0.5, 5.0)], POWER_LIMITS, smu=smu)
+        self.assertIsInstance(error, control_modes.SafetyAbort)
+        self.assertEqual(len(rows), 3)
+        self.assertIn("연속", rows[-1]["abort_reason"])
+        self.assertFalse(smu._output_enabled)
+
+    def test_profile_over_limit_never_touches_the_instrument(self):
+        for mode, profile, limits in (
+                ("voltage", [(5, 1), (13, 1), (12.5, 1)], VOLTAGE_LIMITS),
+                ("current", [(0.2, 1)], CURRENT_LIMITS),
+                ("power", [(-0.1, 1), (2.0, 1)], POWER_LIMITS)):
+            smu = recorder.DummySourceMeasureUnit()
+            with self.subTest(mode=mode), patch.multiple(
+                    recorder, CONTROL_MODE=mode, PROFILE=profile, SAFETY_LIMITS=limits,
+                    use_serial_marker=False):
+                with self.assertRaisesRegex(ValueError, "safety limits") as caught:
+                    recorder.run_profile(smu, Path(self.temp.name) / "never.csv")
+                self.assertFalse(smu._connected)
+                if mode == "voltage":
+                    self.assertIn("2행", str(caught.exception))
+                    self.assertIn("3행", str(caught.exception))
+        self.assertFalse((Path(self.temp.name) / "never.csv").exists())
+
+    def test_new_modes_require_software_limits(self):
+        for mode in ("power", "current"):
+            with patch.multiple(recorder, CONTROL_MODE=mode, SAFETY_LIMITS=None,
+                                use_serial_marker=False):
+                with self.assertRaisesRegex(ValueError, "requires SAFETY_LIMITS"):
+                    recorder.validate_settings()
+
+    def test_infer_state_uses_step_value_in_any_mode(self):
+        self.assertEqual(recorder.infer_state(None, 0.0), "initial_off")
+        self.assertEqual(recorder.infer_state(0.0, 0.5), "heating")
+        self.assertEqual(recorder.infer_state(0.5, 0.3), "cooling")
+        self.assertEqual(recorder.infer_state(0.3, 0.3), "hold")
+        self.assertEqual(recorder.infer_state(0.0, 0.0), "off_hold")
+
+
+class ProfileStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.temp.name) / "profiles"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_name_validation(self):
+        # Surrounding spaces are trimmed, not rejected.
+        self.assertEqual(profile_store.validate_name("  0.5W 가열 10초  "), "0.5W 가열 10초")
+        for bad in ("", "  ", "a/b", "a\\b", "a:b", 'a"b', "a*b", "a?b", "a<b", "a|b",
+                    "tab\there", "끝점.", "점 .", "CON", "com1.json", "x" * 101,
+                    "default", "EXP4"):
+            with self.subTest(name=bad), self.assertRaises(ValueError):
+                profile_store.validate_name(bad)
+
+    def test_save_list_load_delete_round_trip(self):
+        data = {"name": "전력 테스트", "mode": "power",
+                "steps": [{"value": 0.5, "duration_s": 10, "note": "가열"},
+                          {"value": 0, "duration_s": 30, "note": ""}],
+                "limits": {"power": {"I_lim": 0.16, "P_max": 1.0, "V_max": 10.0},
+                           "common": {"R_jump_pct": 5.0}},
+                "description": "설명"}
+        path = profile_store.save_profile(data, self.dir)
+        self.assertEqual(path.name, "전력 테스트.json")
+        with self.assertRaises(FileExistsError):
+            profile_store.save_profile(data, self.dir)
+        first = profile_store.load_profile(path)
+        profile_store.save_profile(dict(data, description="수정"), self.dir, overwrite=True)
+        loaded = profile_store.load_profile(path)
+        self.assertEqual(loaded["created_at"], first["created_at"])
+        self.assertEqual(loaded["description"], "수정")
+        self.assertEqual(loaded["steps"], [
+            {"value": 0.5, "duration_s": 10.0, "note": "가열"},
+            {"value": 0.0, "duration_s": 30.0, "note": ""}])
+        self.assertEqual(loaded["limits"]["power"]["P_max"], 1.0)
+
+        summaries, errors = profile_store.list_profiles(self.dir)
+        self.assertEqual(errors, [])
+        user = [s for s in summaries if not s["builtin"]]
+        self.assertEqual([(s["name"], s["mode"], s["steps"], s["total_s"]) for s in user],
+                         [("전력 테스트", "power", 2, 40.0)])
+        builtin = {s["name"]: s for s in summaries if s["builtin"]}
+        self.assertEqual(builtin["exp4"]["mode"], "voltage")
+
+        profile_store.delete_profile("전력 테스트", self.dir)
+        self.assertFalse(path.exists())
+
+    def test_broken_files_are_reported_not_fatal(self):
+        self.dir.mkdir()
+        (self.dir / "broken.json").write_text("{", encoding="utf-8")
+        (self.dir / "bad_mode.json").write_text(
+            json.dumps({"mode": "magic", "steps": [{"value": 1, "duration_s": 1}]}),
+            encoding="utf-8")
+        summaries, errors = profile_store.list_profiles(self.dir)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(all(s["builtin"] for s in summaries))
+
+    def test_last_settings(self):
+        path = Path(self.temp.name) / "settings" / "last_settings.json"
+        self.assertEqual(profile_store.load_last_settings(path), {})
+        profile_store.save_last_settings({"limits": {"common": {"R_jump_pct": 7}}}, path)
+        self.assertEqual(profile_store.load_last_settings(path)["limits"],
+                         {"common": {"R_jump_pct": 7}})
+        path.write_text("not json", encoding="utf-8")
+        self.assertEqual(profile_store.load_last_settings(path), {})
+
+
+class FakeInstrument:
+    def __init__(self, replies=()):
+        self.writes = []
+        self.replies = list(replies)
+
+    def write(self, command):
+        self.writes.append(command)
+
+    def query(self, command):
+        self.writes.append(command)
+        return self.replies.pop(0)
+
+    def close(self):
+        pass
+
+
+class DriverTests(unittest.TestCase):
+    def keithley(self, replies=()):
+        smu = driver.Keithley2450("fake", current_limit=0.16)
+        smu._instrument = FakeInstrument(replies)
+        return smu
+
+    def test_current_source_configuration_commands(self):
+        smu = self.keithley()
+        smu.configure_current_source(4, 12.0)
+        self.assertEqual(smu._instrument.writes, [
+            ":SOUR:FUNC CURR", ":SOUR:CURR 0", ":SOUR:CURR:VLIM 12",
+            ':SENS:FUNC "VOLT"', ":SENS:VOLT:RANG:AUTO ON", ":SENS:VOLT:RSEN ON",
+            ":SOUR:CURR:READ:BACK ON", ':TRAC:CLE "defbuffer1"'])
+        smu._instrument.writes.clear()
+        smu.set_current(0.02)
+        smu.set_source_zero()
+        self.assertEqual(smu._instrument.writes, [":SOUR:CURR 0.02", ":SOUR:CURR 0"])
+        with self.assertRaises(RuntimeError):
+            smu.set_voltage(1.0)
+
+    def test_source_function_never_changes_with_output_on(self):
+        for smu in (self.keithley(), recorder.DummySourceMeasureUnit()):
+            smu.connect() if isinstance(smu, recorder.DummySourceMeasureUnit) else None
+            smu.output_on()
+            with self.assertRaises(RuntimeError):
+                smu.configure_current_source(2, 12.0)
+            smu.output_off()
+            smu.configure_current_source(2, 12.0)
+
+    def test_current_source_measure_maps_reading_and_readback(self):
+        smu = self.keithley(replies=["1.6", "0.02"])
+        smu.configure_current_source(2, 12.0)
+        measured = smu.measure()
+        self.assertEqual((measured.voltage, measured.current), (1.6, 0.02))
+        self.assertAlmostEqual(measured.resistance, 80.0)
+
+    def test_dummy_power_heats_and_raises_resistance(self):
+        smu = recorder.DummySourceMeasureUnit(noise_ratio=0.0, time_constant_s=0.05)
+        smu.connect()
+        smu.set_voltage(8.0)
+        smu.output_on()
+        cold = smu.measure().resistance
+        time.sleep(0.3)
+        hot = smu.measure().resistance
+        self.assertGreater(hot, cold * 1.1)
 
 
 if __name__ == "__main__":
