@@ -18,6 +18,7 @@ import control_modes
 import keithley_driver as driver
 import main_gui
 import manual_voltage_profile as recorder
+import profile_builder
 import profile_store
 
 
@@ -857,6 +858,103 @@ class RrefStepTests(RecorderTestBase):
                     use_serial_marker=False, CURRENT_LIMIT=0.16):
                 with self.assertRaisesRegex(ValueError, message):
                     recorder.validate_settings()
+
+
+class ProfileBuilderTests(RecorderTestBase):
+    """Repeat block / reference-return sweep generators (profile_builder)."""
+
+    COND = {"type": "rref", "t_min_s": 10, "t_max_s": 40, "tol_pct": 0.5, "k_samples": 5}
+
+    def test_sweep_order_count_and_notes(self):
+        steps = profile_builder.sweep_steps(
+            "power", ref_value=0.3, test_values=profile_builder.value_range(0.4, 0.7, 0.1),
+            heat_s=8, cooling=self.COND, ref_initial=2, test_repeats=3, ref_between=1,
+            idle_s=5, include_rref=True)
+        self.assertEqual(len(steps), 1 + 1 + 2 * (2 + 4 * (3 + 1)))
+        self.assertEqual(steps[0], {"value": 0.0, "duration_s": 5.0, "note": "idle"})
+        self.assertEqual((steps[1]["kind"], steps[1]["duration_s"], steps[1]["note"]),
+                         ("rref", 30.0, "R_ref measure"))
+        notes = [s["note"] for s in steps[2:]]
+        self.assertEqual(notes[:10], [
+            "ref 0.3W #1 heat", "ref 0.3W #1 cool", "ref 0.3W #2 heat", "ref 0.3W #2 cool",
+            "test 0.4W #1 heat", "test 0.4W #1 cool", "test 0.4W #2 heat",
+            "test 0.4W #2 cool", "test 0.4W #3 heat", "test 0.4W #3 cool"])
+        self.assertEqual(notes[10:12], ["ref 0.3W #1 heat", "ref 0.3W #1 cool"])
+        self.assertEqual(notes[-8:-2], ["test 0.7W #1 heat", "test 0.7W #1 cool",
+                                        "test 0.7W #2 heat", "test 0.7W #2 cool",
+                                        "test 0.7W #3 heat", "test 0.7W #3 cool"])
+        heats = [s["value"] for s in steps if s["value"] != 0]
+        self.assertEqual(heats, [0.3, 0.3] + [0.4] * 3 + [0.3] + [0.5] * 3 + [0.3]
+                         + [0.6] * 3 + [0.3] + [0.7] * 3 + [0.3])
+        for step in steps[2:]:
+            if step["value"] == 0:
+                self.assertEqual(step["duration_s"], 40.0)              # t_max
+                self.assertEqual(step["end"], {"type": "rref", "t_min_s": 10.0,
+                                               "tol_pct": 0.5, "k_samples": 5})
+            else:
+                self.assertEqual(step["duration_s"], 8.0)
+        self.assertEqual(control_modes.validate_step_plan(
+            [(s["value"], s["duration_s"], s) for s in steps], PROBE, None), [])
+
+        summary = profile_builder.summarize(
+            steps, "power", {"P_max": 1.1, "V_max": 6, "R_jump_pct": 10,
+                             "probe_V": 0.1, "max_step_V": 1, "max_R_failures": 3})
+        self.assertEqual((summary["steps"], summary["cycles"], summary["max_value"]),
+                         (38, 18, 0.7))
+        self.assertEqual(summary["total_min_s"], 5 + 30 + 18 * (8 + 10))
+        self.assertEqual(summary["total_max_s"], 5 + 30 + 18 * (8 + 40))
+        self.assertEqual(summary["violations"], [])
+
+    def test_sweep_over_limit_is_reported(self):
+        steps = profile_builder.sweep_steps(
+            "power", ref_value=0.3, test_values=[0.5, 0.7], heat_s=8,
+            cooling={"type": "fixed", "duration_s": 15}, idle_s=0)
+        summary = profile_builder.summarize(steps, "power", dict(POWER_LIMITS, P_max=0.6))
+        self.assertEqual(len(summary["violations"]), 3)                # three 0.7 W heats
+        self.assertTrue(all("0.7 W > P_max 0.6 W" in v for v in summary["violations"]))
+        self.assertEqual(steps[0]["note"], "ref 0.3W #1 heat")         # idle_s=0: no idle
+
+    def test_block_and_value_helpers(self):
+        steps = profile_builder.block_steps("current", 0.02, 10,
+                                            {"type": "fixed", "duration_s": 30}, 2)
+        self.assertEqual([(s["value"], s["duration_s"], s["note"]) for s in steps], [
+            (0.02, 10.0, "20mA #1 heat"), (0.0, 30.0, "20mA #1 cool"),
+            (0.02, 10.0, "20mA #2 heat"), (0.0, 30.0, "20mA #2 cool")])
+        steps = profile_builder.block_steps("power", 0.5, 8, self.COND, 1, prefix="길들임")
+        self.assertEqual([s["note"] for s in steps], ["길들임 #1 heat", "길들임 #1 cool"])
+        self.assertIn("end", steps[1])
+        self.assertEqual(profile_builder.value_range(0.4, 1.1, 0.1),
+                         [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1])
+        self.assertEqual(profile_builder.parse_value_list("0.4, 0.5 ,0.6"), [0.4, 0.5, 0.6])
+        for call in (lambda: profile_builder.value_range(0.4, 0.75, 0.1),
+                     lambda: profile_builder.parse_value_list("0.4, x"),
+                     lambda: profile_builder.block_steps("power", 0, 8, self.COND, 1),
+                     lambda: profile_builder.block_steps("power", 0.5, 8, self.COND, 0),
+                     lambda: profile_builder.block_steps(
+                         "power", 0.5, 8, dict(self.COND, t_max_s=5), 1)):
+            with self.assertRaises(ValueError):
+                call()
+
+    def test_generated_sweep_runs_on_dummy(self):
+        steps = profile_builder.sweep_steps(
+            "power", ref_value=0.1, test_values=[0.15], heat_s=0.2,
+            cooling={"type": "slope", "t_max_s": 1.0, "t_min_s": 0.1, "window_s": 0.2,
+                     "slope_pct_per_s": 2.0},
+            ref_initial=1, test_repeats=1, ref_between=1, idle_s=0.1, include_rref=True,
+            rref_spec={"t_on_s": 0.2, "t_off_s": 0.1, "repeats": 1})
+        profile = [(s["value"], s["duration_s"], 1, s["note"],
+                    {k: s[k] for k in ("kind", "rref", "end") if k in s}) for s in steps]
+        smu = recorder.DummySourceMeasureUnit(base_resistance=30.0, current_limit=0.16,
+                                              noise_ratio=0.0005, time_constant_s=0.05)
+        smu, rows, error = self.run_mode("power", profile, dict(POWER_LIMITS, R_jump_pct=30),
+                                         smu=smu, PROBE=PROBE)
+        self.assertIsNone(error)
+        self.assertEqual([r["phase"] for r in rows][0], "idle")
+        self.assertEqual(max(int(r["cycle_number"]) for r in rows), 3)
+        self.assertEqual({r["cooling_end_reason"] for r in rows if r["phase"] == "cooling"}
+                         - {""}, {"condition"})
+        self.assertEqual({r["step_note"] for r in rows if r["phase"] == "rref"},
+                         {"R_ref measure"})
 
 
 class ProfileStoreTests(unittest.TestCase):
