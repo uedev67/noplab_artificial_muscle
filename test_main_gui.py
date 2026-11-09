@@ -712,6 +712,57 @@ class ControlModeRecorderTests(RecorderTestBase):
         self.assertEqual(len(rows), 5)
         self.assertFalse(smu._output_enabled)
 
+    def test_zero_output_transient_after_heating_is_not_a_jump(self):
+        """Heating -> 0 V cooling: an output-off transient reads e.g.
+        47.5 -> 0.019 ohm.  No current is sourced, so this is not a jump."""
+        cases = {"voltage": ([(2.0, 0.3), (0.0, 0.3), (2.0, 0.3)], VOLTAGE_LIMITS),
+                 "current": ([(0.05, 0.3), (0.0, 0.3), (0.05, 0.3)], CURRENT_LIMITS),
+                 "power": ([(0.3, 0.3), (0.0, 0.3), (0.3, 0.3)], POWER_LIMITS)}
+        for mode, (profile, limits) in cases.items():
+            with self.subTest(mode=mode):
+                smu = recorder.DummySourceMeasureUnit(base_resistance=47.5,
+                                                      current_limit=0.16, noise_ratio=0.0)
+                measure = smu.measure
+                state = {"zero": 0}
+
+                def transient(measure=measure, smu=smu, state=state):
+                    if smu._voltage == 0 and smu._current == 0:
+                        state["zero"] += 1
+                        # 1st 0-output sample: decaying current, V already ~0.
+                        current = 1.5e-4 if state["zero"] == 1 else 5e-6
+                        return driver.Measurement(2.9e-6, current, 2.9e-6 / current)
+                    return measure()
+                smu.measure = transient
+                smu, rows, error = self.run_mode(mode, profile, limits, smu=smu,
+                                                 name=f"transient_{mode}.csv")
+                self.assertIsNone(error)
+                cool = step_rows(rows, 2)
+                self.assertAlmostEqual(float(cool[0]["resistance_ohm"]), 0.019, places=3)
+                self.assertEqual(cool[0]["phase"], "cooling")
+                self.assertEqual(len(step_rows(rows, 3)) > 0, True)     # ran to the end
+                # The meaningless R does not become the cold R before heating.
+                self.assertEqual(step_rows(rows, 3)[0]["R_cold_before_heating_ohm"], "")
+                self.assertFalse(smu._output_enabled)
+
+    def test_zero_output_samples_do_not_hide_a_jump_while_heating(self):
+        smu = recorder.DummySourceMeasureUnit(base_resistance=30.0, current_limit=0.16,
+                                              noise_ratio=0.0)
+        measure = smu.measure
+        calls = []
+
+        def jumping():
+            if smu._voltage > 0:
+                calls.append(1)
+                if len(calls) == 4:
+                    smu.base_resistance *= 1.2
+            return measure()
+        smu.measure = jumping
+        smu, rows, error = self.run_mode("voltage", [(0.0, 0.1), (1.0, 5.0)],
+                                         VOLTAGE_LIMITS, smu=smu)
+        self.assertIsInstance(error, control_modes.SafetyAbort)
+        self.assertIn("저항 급변", rows[-1]["abort_reason"])
+        self.assertFalse(smu._output_enabled)
+
     def test_power_mode_aborts_after_repeated_invalid_resistance(self):
         smu = recorder.DummySourceMeasureUnit(current_limit=0.16)
         smu.measure = lambda: driver.Measurement(0.1, 0.0, float("inf"))

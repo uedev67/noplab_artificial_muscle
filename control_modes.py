@@ -235,12 +235,18 @@ class SafetyMonitor:
         self.previous_resistance = None
 
     def check(self, set_value: float, command_voltage: float | None, measured,
-              probe_v_max: float | None = None) -> str:
+              probe_v_max: float | None = None, sourcing: bool = True) -> str:
         """Return an abort reason ("" if every limit holds).
 
         *probe_v_max* is given while the probe current is being sourced in a
         0-output step: the probe command voltage (voltage source) or the
         measured voltage (current source) must stay at or below it.
+
+        *sourcing* is False in a true 0-output sample (0 V / 0 A, no probe
+        current).  V and I are then only noise and output-off transients, so
+        R = V/I means nothing: the sample is left out of the R-jump check and
+        the next sourced sample starts a new comparison.  Every other limit
+        is still checked.
         """
         limits = self.limits
         if not (math.isfinite(measured.voltage) and math.isfinite(measured.current)):
@@ -290,7 +296,11 @@ class SafetyMonitor:
                 )
 
         # Common: resistance must not jump between two consecutive valid samples.
-        if self.jump_skip > 0:
+        if not sourcing:
+            # No current is sourced: nothing to compare (e.g. heating -> 0 V
+            # cooling read 47.5 -> 0.019 ohm from an output-off transient).
+            self.previous_resistance = None
+        elif self.jump_skip > 0:
             # Glitched samples must not become the reference either: the
             # first valid sample after the window starts a new comparison.
             self.jump_skip -= 1

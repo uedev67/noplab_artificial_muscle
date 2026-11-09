@@ -1285,6 +1285,7 @@ def run_profile(
                         command_voltage,
                         measured,
                         probe_v_max,
+                        sourcing=regime != "zero",
                     )
 
                 next_command = command_voltage
@@ -1306,7 +1307,10 @@ def run_profile(
                             measured
                         )
 
-                r_valid = resistance_is_valid(measured)
+                # A true 0-output sample has no meaningful R (noise and
+                # output-off transients): it must not seed the probe start,
+                # R_cold_before_heating or the R_ref segments.
+                r_valid = regime != "zero" and resistance_is_valid(measured)
 
                 if r_valid:
                     last_valid_resistance = measured.resistance
