@@ -293,7 +293,12 @@ class DummySourceMeasureUnit(SourceMeasureUnit):
     CNT+PDMS 시료처럼 전력에 따라 저항이 올라가는(PTC) 1차 지연 열 모델:
         dT/dt = (P * thermal_resistance - dT) / time_constant
         R = base_resistance * (1 + alpha * dT)
+    출력이 0이면 dT가 time_constant로 지수 감소한다(시간에 따라 식는다).
     장비 compliance(전압 소스의 전류 제한, 전류 소스의 전압 제한)도 흉내 낸다.
+
+    길들임(선택, training_gain_per_w > 0): 지금까지 겪은 최고 전력을 넘는
+    전력을 처음 겪으면 냉각 상태 저항(base_resistance)이 영구히 오른다.
+        base += initial_base * training_gain_per_w * (P_new_max - P_old_max)
     """
 
     def __init__(
@@ -304,14 +309,18 @@ class DummySourceMeasureUnit(SourceMeasureUnit):
         thermal_resistance_k_per_w: float = 60.0,
         alpha_per_k: float = 0.005,
         time_constant_s: float = 2.0,
+        training_gain_per_w: float = 0.0,
     ) -> None:
         self.base_resistance = base_resistance
+        self.initial_base_resistance = base_resistance
         self.noise_ratio = noise_ratio
         self.current_limit = current_limit
         self.voltage_limit: float | None = None
         self.thermal_resistance = thermal_resistance_k_per_w
         self.alpha = alpha_per_k
         self.time_constant = time_constant_s
+        self.training_gain = training_gain_per_w
+        self.max_power_seen = 0.0
         self.temperature_rise = 0.0
         self._source_function = "voltage"
         self._voltage = 0.0
@@ -396,10 +405,18 @@ class DummySourceMeasureUnit(SourceMeasureUnit):
         dt = now - self._last_update
         self._last_update = now
         voltage, current = self._electrical(self.resistance())
-        steady = abs(voltage * current) * self.thermal_resistance
+        power = abs(voltage * current)
+        steady = power * self.thermal_resistance
         self.temperature_rise += (steady - self.temperature_rise) * (
             1.0 - math.exp(-dt / self.time_constant)
         )
+        if self.training_gain > 0.0 and power > self.max_power_seen:
+            self.base_resistance += (
+                self.initial_base_resistance
+                * self.training_gain
+                * (power - self.max_power_seen)
+            )
+            self.max_power_seen = power
 
     def measure(self) -> Measurement:
         self._check_connected()

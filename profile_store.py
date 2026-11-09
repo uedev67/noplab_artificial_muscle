@@ -3,18 +3,28 @@
 One JSON file per profile:
 
     {
-      "format_version": 1,
+      "format_version": 2,
       "name": "0.5W 가열 10초",
       "mode": "power",                     # voltage | power | current
       "value_unit": "W",                   # SI unit of step values
       "steps": [{"value": 0.5, "duration_s": 10.0, "note": ""}, ...],
       "limits": {"power": {...}, "common": {...}, "power_control": {...}},
+      "probe": {"enabled": false, "I_probe_A": 0.001, "V_probe_max_V": 0.2,
+                "R_jump_skip_samples": 2},
+      "R_ref": {"manual_ohm": null},
+      "cooling": {"timeout_abort": false, "timeout_abort_count": 2},
       "description": "",
       "created_at": "2026-11-08T12:00:00+09:00",
       "updated_at": "2026-11-08T12:00:00+09:00"
     }
 
 Step values are SI (current mode stores A even though the GUI shows mA).
+A step may also carry options (control_modes.normalize_step_options):
+    "end": {"type": "rref" | "slope", ...}   conditional cooling, duration = t_max
+    "kind": "rref", "rref": {...}             R_ref measurement step
+
+format_version 1 files (no probe / R_ref / cooling / step options) load with
+the defaults: probe off, fixed-duration steps.  Saving writes version 2.
 The read-only voltage profiles in voltage_profiles.PROFILES are listed as
 built-in profiles.
 """
@@ -34,7 +44,8 @@ from voltage_profiles import PROFILES as BUILTIN_PROFILES
 BASE_DIR = Path(__file__).resolve().parent
 PROFILE_DIR = BASE_DIR / "profiles"
 SETTINGS_PATH = BASE_DIR / "settings" / "last_settings.json"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS = (1, 2)
 
 MAX_NAME_LENGTH = 100
 _INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -90,6 +101,12 @@ def normalize_profile(data: dict) -> dict:
     """Validate a profile dict (from disk or the GUI) and return a clean copy."""
     if not isinstance(data, dict):
         raise ValueError("프로파일 형식이 올바르지 않습니다.")
+    version = data.get("format_version", 1)
+    if version not in SUPPORTED_FORMAT_VERSIONS:
+        raise ValueError(
+            f"지원하지 않는 프로파일 형식 버전입니다: {version!r} "
+            f"(지원: {', '.join(map(str, SUPPORTED_FORMAT_VERSIONS))})"
+        )
     mode = data.get("mode")
     info = control_modes.mode_info(mode)
     steps = []
@@ -100,8 +117,14 @@ def normalize_profile(data: dict) -> dict:
         duration = _number(step.get("duration_s"), f"{index}단계 시간")
         if duration <= 0:
             raise ValueError(f"{index}단계 시간은 0보다 커야 합니다.")
-        steps.append({"value": value, "duration_s": duration,
-                      "note": str(step.get("note", ""))})
+        clean = {"value": value, "duration_s": duration,
+                 "note": str(step.get("note", ""))}
+        try:
+            clean.update(control_modes.normalize_step_options(
+                {key: step[key] for key in ("kind", "rref", "end") if key in step}))
+        except ValueError as exc:
+            raise ValueError(f"{index}단계: {exc}") from None
+        steps.append(clean)
     if not steps:
         raise ValueError("프로파일에 단계가 없습니다.")
 
@@ -121,10 +144,36 @@ def normalize_profile(data: dict) -> dict:
         "value_unit": info.si_unit,
         "steps": steps,
         "limits": limits,
+        **normalize_cooling_settings(data),
         "description": str(data.get("description", "")),
         "created_at": str(data.get("created_at", "")),
         "updated_at": str(data.get("updated_at", "")),
     }
+
+
+def normalize_cooling_settings(data: dict) -> dict:
+    """probe / R_ref / cooling sections with defaults (v1 files have none)."""
+    probe = control_modes.normalize_probe(
+        data.get("probe") if data.get("probe") is not None else {})
+    r_ref = data.get("R_ref") or {}
+    if not isinstance(r_ref, dict):
+        raise ValueError("R_ref 설정 형식이 올바르지 않습니다.")
+    manual = r_ref.get("manual_ohm")
+    if manual is not None:
+        manual = _number(manual, "R_ref 수동 입력값")
+        if manual <= 0:
+            raise ValueError("R_ref 수동 입력값은 0보다 커야 합니다.")
+    cooling = dict(control_modes.DEFAULT_COOLING)
+    raw = data.get("cooling") or {}
+    if not isinstance(raw, dict):
+        raise ValueError("냉각 설정 형식이 올바르지 않습니다.")
+    cooling.update({k: v for k, v in raw.items() if k in cooling})
+    cooling["timeout_abort"] = bool(cooling["timeout_abort"])
+    count = cooling["timeout_abort_count"]
+    if isinstance(count, bool) or not isinstance(count, (int, float))             or count != int(count) or count < 1:
+        raise ValueError("타임아웃 연속 횟수는 1 이상의 정수여야 합니다.")
+    cooling["timeout_abort_count"] = int(count)
+    return {"probe": probe, "R_ref": {"manual_ohm": manual}, "cooling": cooling}
 
 
 def _write_json(path: Path, data: dict) -> None:
@@ -187,6 +236,7 @@ def builtin_profile(name: str) -> dict:
         "value_unit": "V",
         "steps": steps,
         "limits": {},
+        **normalize_cooling_settings({}),
         "description": "기본 제공 (voltage_profiles.py, 읽기 전용)",
         "created_at": "",
         "updated_at": "",
@@ -199,6 +249,11 @@ def _summary(profile: dict, builtin: bool, path: Path | None) -> dict:
         "mode": profile["mode"],
         "steps": len(profile["steps"]),
         "total_s": sum(step["duration_s"] for step in profile["steps"]),
+        # Conditional cooling steps may end at t_min (total_s uses t_max).
+        "total_min_s": sum(
+            step["end"]["t_min_s"] if "end" in step else step["duration_s"]
+            for step in profile["steps"]
+        ),
         "updated_at": profile["updated_at"],
         "description": profile["description"],
         "builtin": builtin,
