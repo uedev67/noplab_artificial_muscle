@@ -64,6 +64,30 @@ def format_duration(seconds: float) -> str:
     return f"{seconds:g}초"
 
 
+SECTION_BORDER = "#8b9bb4"   # section frame border
+SECTION_TITLE = "#1f3b63"    # section frame title
+SECTION_PAD = 8              # inner padding of a section frame
+SECTION_GAP = 8              # space between section frames
+
+
+def apply_section_style(root, title_font):
+    """Clearly visible borders + bold titles for every ttk.LabelFrame.
+
+    The Windows ("vista") theme draws a very faint LabelFrame border and
+    ignores colour options, so only the border element is borrowed from the
+    built-in "clam" theme.  Buttons, entries etc. keep the native look.
+    """
+    style = ttk.Style(root)
+    try:
+        style.element_create("Section.Labelframe.border", "from", "clam", "Labelframe.border")
+    except tk.TclError:
+        pass   # already created in this Tk interpreter
+    style.layout("TLabelframe", [("Section.Labelframe.border", {"sticky": "nswe"})])
+    style.configure("TLabelframe", bordercolor=SECTION_BORDER, lightcolor=SECTION_BORDER,
+                    darkcolor=SECTION_BORDER, borderwidth=1, relief="solid")
+    style.configure("TLabelframe.Label", font=title_font, foreground=SECTION_TITLE)
+
+
 class QueueWriter:
     def __init__(self, messages):
         self.messages = messages
@@ -622,6 +646,11 @@ class ExperimentGUI:
         self._suspend_dirty = True
         self.profile_list = None
 
+        self.normal_font = tkfont.nametofont("TkDefaultFont")
+        self.bold_font = self.normal_font.copy()
+        self.bold_font.configure(weight="bold")
+        apply_section_style(root, self.bold_font)
+
         # Left: experiment UI.  Right: live graph (display only).
         panes = ttk.PanedWindow(root, orient="horizontal")
         panes.pack(fill="both", expand=True)
@@ -631,20 +660,27 @@ class ExperimentGUI:
         panes.add(self.live_plot.frame, weight=2)
 
         notebook = ttk.Notebook(left)
-        notebook.pack(fill="both", expand=True, padx=12, pady=10)
+        notebook.pack(fill="both", expand=True, padx=12, pady=(10, SECTION_GAP))
         basic = ttk.Frame(notebook, padding=12)
         advanced = ttk.Frame(notebook, padding=12)
         notebook.add(basic, text="측정 / 제어 프로파일")
         notebook.add(advanced, text="장비 / 실험 정보")
-        basic.columnconfigure(1, weight=1)
-        self.field(basic, 0, "샘플 번호", "sample", "")
-        self.field(basic, 1, "사이클 번호 (반복 횟수 아님)", "cycle", "1")
-        self.field(basic, 2, "저장 폴더", "directory", str(Path(__file__).resolve().parent / "data"))
-        browse = ttk.Button(basic, text="폴더 선택", command=self.browse)
-        browse.grid(row=2, column=2, padx=5)
+        basic.columnconfigure(0, weight=1)
+        top = ttk.Frame(basic)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(0, weight=1)
+        ident = ttk.LabelFrame(top, text="샘플 · 저장 위치", padding=SECTION_PAD)
+        ident.grid(row=0, column=0, sticky="nsew")
+        ident.columnconfigure(1, weight=1)
+        self.field(ident, 0, "샘플 번호", "sample", "")
+        self.field(ident, 1, "사이클 번호 (반복 횟수 아님)", "cycle", "1")
+        self.field(ident, 2, "저장 폴더", "directory", str(Path(__file__).resolve().parent / "data"))
+        browse = ttk.Button(ident, text="폴더 선택", command=self.browse)
+        browse.grid(row=2, column=2, padx=(5, 0))
         self.editors.append(browse)
         self.preview = tk.StringVar()
-        ttk.Label(basic, textvariable=self.preview).grid(row=3, column=0, columnspan=3, sticky="w", pady=6)
+        ttk.Label(ident, textvariable=self.preview).grid(row=3, column=0, columnspan=3, sticky="w",
+                                                         pady=(4, 0))
         for key in ("sample", "cycle", "directory"):
             self.variables[key].trace_add("write", self.update_preview)
         self.update_preview()
@@ -652,12 +688,10 @@ class ExperimentGUI:
         # ------------------------------------------------------------------
         # Control mode buttons
         # ------------------------------------------------------------------
-        mode_bar = ttk.Frame(basic)
-        mode_bar.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(4, 2))
-        ttk.Label(mode_bar, text="제어 모드").pack(side="left", padx=(0, 8))
-        self.normal_font = tkfont.nametofont("TkDefaultFont")
-        self.bold_font = self.normal_font.copy()
-        self.bold_font.configure(weight="bold")
+        mode_frame = ttk.LabelFrame(top, text="제어 모드", padding=SECTION_PAD)
+        mode_frame.grid(row=0, column=1, sticky="nsew", padx=(SECTION_GAP, 0))
+        mode_bar = ttk.Frame(mode_frame)
+        mode_bar.pack(anchor="w")
         self.mode_var = tk.StringVar(value=self.mode)
         self.mode_buttons = {}
         for key, info in MODES.items():
@@ -668,14 +702,16 @@ class ExperimentGUI:
             button.pack(side="left", padx=2)
             self.mode_buttons[key] = button
         self.mode_hint = tk.StringVar()
-        ttk.Label(basic, textvariable=self.mode_hint, foreground="#444").grid(
-            row=5, column=0, columnspan=3, sticky="w")
+        ttk.Label(mode_frame, textvariable=self.mode_hint, foreground="#444", wraplength=420,
+                  justify="left").pack(anchor="w", pady=(6, 0))
 
         # ------------------------------------------------------------------
         # Profile toolbar
         # ------------------------------------------------------------------
-        toolbar = ttk.Frame(basic)
-        toolbar.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 2))
+        file_frame = ttk.LabelFrame(basic, text="프로파일 파일", padding=SECTION_PAD)
+        file_frame.grid(row=1, column=0, sticky="ew", pady=(SECTION_GAP, 0))
+        toolbar = ttk.Frame(file_frame)
+        toolbar.pack(fill="x")
         for text, command in (("프로파일 목록", self.open_profile_list),
                               ("저장", self.save_profile),
                               ("다른 이름으로 저장", self.save_profile_as),
@@ -686,8 +722,8 @@ class ExperimentGUI:
         self.profile_status = tk.StringVar()
         self.profile_status_label = ttk.Label(toolbar, textvariable=self.profile_status)
         self.profile_status_label.pack(side="left", padx=10)
-        description_bar = ttk.Frame(basic)
-        description_bar.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(2, 6))
+        description_bar = ttk.Frame(file_frame)
+        description_bar.pack(fill="x", pady=(6, 0))
         ttk.Label(description_bar, text="프로파일 설명").pack(side="left", padx=(0, 8))
         self.description = tk.StringVar()
         description = ttk.Entry(description_bar, textvariable=self.description)
@@ -699,13 +735,16 @@ class ExperimentGUI:
         # Profile table (left) + safety limits (right)
         # ------------------------------------------------------------------
         content = ttk.Frame(basic)
-        content.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        content.grid(row=2, column=0, sticky="nsew", pady=(SECTION_GAP, 0))
         content.columnconfigure(0, weight=1)
         content.rowconfigure(0, weight=1)
-        basic.rowconfigure(8, weight=1)
+        basic.rowconfigure(2, weight=1)
 
-        profile = ttk.LabelFrame(content, text="제어 프로파일 · 위에서 아래로 한 번 실행", padding=6)
+        profile = ttk.LabelFrame(content, text="제어 프로파일 · 위에서 아래로 한 번 실행",
+                                 padding=SECTION_PAD)
         profile.grid(row=0, column=0, sticky="nsew")
+        row_buttons = ttk.Frame(profile)   # step-add buttons, filled in below
+        row_buttons.pack(side="bottom", fill="x", pady=(6, 0))
         canvas = tk.Canvas(profile, height=200, highlightthickness=0)
         scrollbar = ttk.Scrollbar(profile, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
@@ -727,12 +766,10 @@ class ExperimentGUI:
             self.add_row(format_number(voltage), format_number(duration), note)
 
         side = ttk.Frame(content)
-        side.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        side.grid(row=0, column=1, sticky="nsew", padx=(SECTION_GAP, 0))
         self.build_safety_panel(side)
         self.build_probe_panel(side)
 
-        row_buttons = ttk.Frame(basic)
-        row_buttons.grid(row=9, column=0, columnspan=3, sticky="w", pady=6)
         for text, command in (("+ 행 추가", self.add_row),
                               ("R_ref 측정 단계 추가", self.open_rref_dialog),
                               ("반복 블록 추가", self.open_block_dialog),
@@ -744,7 +781,10 @@ class ExperimentGUI:
         # ------------------------------------------------------------------
         # Advanced tab
         # ------------------------------------------------------------------
-        advanced.columnconfigure(1, weight=1)
+        advanced.columnconfigure(0, weight=1)
+        device = ttk.LabelFrame(advanced, text="장비 · 측정 설정", padding=SECTION_PAD)
+        device.grid(row=0, column=0, sticky="ew")
+        device.columnconfigure(1, weight=1)
         settings = [
             ("센싱 방식", "WIRE_MODE", recorder.WIRE_MODE),
             ("샘플링 간격 (초)", "SAMPLE_INTERVAL_S", recorder.SAMPLE_INTERVAL_S),
@@ -753,8 +793,8 @@ class ExperimentGUI:
             ("Arduino baudrate", "SERIAL_MARKER_BAUDRATE", recorder.SERIAL_MARKER_BAUDRATE),
         ]
         for row, (label, key, value) in enumerate(settings):
-            self.field(advanced, row, label, key, value, choices=(2, 4) if key == "WIRE_MODE" else None)
-        ttk.Label(advanced, foreground="#444",
+            self.field(device, row, label, key, value, choices=(2, 4) if key == "WIRE_MODE" else None)
+        ttk.Label(device, foreground="#444",
                   text="전류 제한(I_lim) / 전압 제한(V_lim)은 첫 탭의 '안전 상한'에서 설정합니다.").grid(
             row=len(settings), column=0, columnspan=2, sticky="w", pady=(0, 4))
         self.marker = tk.BooleanVar(value=recorder.use_serial_marker)
@@ -762,7 +802,7 @@ class ExperimentGUI:
         first = len(settings) + 1
         for row, label, variable in ((first, "Arduino 시작 마커 사용", self.marker),
                                      (first + 1, "더미 모드 (장비 연결 없이 테스트)", self.dummy)):
-            widget = ttk.Checkbutton(advanced, text=label, variable=variable)
+            widget = ttk.Checkbutton(device, text=label, variable=variable)
             widget.grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
             self.editors.append(widget)
         metadata = [
@@ -773,10 +813,15 @@ class ExperimentGUI:
             ("실험 메모", "GENERAL_NOTE"),
         ]
         self.metadata_keys = [key for _, key in metadata]
-        for row, (label, key) in enumerate(metadata, first + 2):
-            self.field(advanced, row, label, key, getattr(recorder, key))
+        meta = ttk.LabelFrame(advanced, text="실험 정보 · CSV에 함께 기록", padding=SECTION_PAD)
+        meta.grid(row=1, column=0, sticky="ew", pady=(SECTION_GAP, 0))
+        meta.columnconfigure(1, weight=1)
+        for row, (label, key) in enumerate(metadata):
+            self.field(meta, row, label, key, getattr(recorder, key))
 
-        controls = ttk.Frame(left, padding=(12, 0))
+        run_frame = ttk.LabelFrame(left, text="실행 · 측정 로그", padding=SECTION_PAD)
+        run_frame.pack(fill="both", padx=12, pady=(0, 10))
+        controls = ttk.Frame(run_frame)
         controls.pack(fill="x")
         self.start_button = ttk.Button(controls, text="시작 (키슬리 실행)", command=self.start)
         self.start_button.pack(side="left")
@@ -784,8 +829,8 @@ class ExperimentGUI:
         self.stop_button.pack(side="left", padx=8)
         self.status = tk.StringVar(value="대기 중 · 시작 버튼을 누르면 장비에 연결합니다.")
         ttk.Label(controls, textvariable=self.status).pack(side="left")
-        self.log = ScrolledText(left, height=8, state="disabled", wrap="word")
-        self.log.pack(fill="both", padx=12, pady=10)
+        self.log = ScrolledText(run_frame, height=8, state="disabled", wrap="word")
+        self.log.pack(fill="both", pady=(6, 0))
 
         self.restore_last_settings()
         self._suspend_dirty = False
