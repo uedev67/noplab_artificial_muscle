@@ -746,7 +746,10 @@ def run_profile(
     """Run PROFILE in CONTROL_MODE and log every sample to *output_path*.
 
     *on_event(kind, value)* (optional) is called with ("R_ref", ohm) when an
-    R_ref measurement step has computed R_ref.
+    R_ref measurement step has computed R_ref, and with ("sample", row) after
+    every CSV row is written (row = the dict just written; display only).
+    An exception from the "sample" callback never stops the measurement: it
+    is reported once and the callback is not called again in this run.
 
     Raises SafetyAbort (after output 0 + OFF and a CSV row with
     ``abort_reason``) when a software limit in SAFETY_LIMITS is exceeded.
@@ -815,6 +818,7 @@ def run_profile(
     )
 
     csv_file: TextIO | None = None
+    sample_event_enabled = True
     serial_marker = None
     marker_sent = False
 
@@ -1543,8 +1547,7 @@ def run_profile(
                 # Save CSV row
                 # -------------------------------------------------------------
 
-                writer.writerow(
-                    {
+                csv_row = {
                         # identification
                         "experiment_id": EXPERIMENT_ID,
                         "sample_id": SAMPLE_ID,
@@ -1631,10 +1634,23 @@ def run_profile(
                         "cooling_end_reason": cooling_end_reason,
                         "cooling_duration_s": cooling_duration,
                     }
-                )
+
+                writer.writerow(csv_row)
 
                 # Immediately flush to reduce loss if experiment crashes.
                 csv_file.flush()
+
+                # Live display (GUI graph).  Display only: a failure here must
+                # never stop or delay the measurement.
+                if on_event is not None and sample_event_enabled:
+                    try:
+                        on_event("sample", csv_row)
+                    except Exception as exc:
+                        sample_event_enabled = False
+                        print(
+                            "WARNING: live display callback failed; "
+                            f"measurement continues ({exc!r})"
+                        )
 
 
                 # -------------------------------------------------------------

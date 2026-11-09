@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import control_modes
 import keithley_driver as driver
+import live_plot
 import main_gui
 import manual_voltage_profile as recorder
 import profile_builder
@@ -1097,9 +1098,14 @@ class RrefStepTests(RecorderTestBase):
                             float(row["resistance_ohm"]))
                 self.assertEqual(sorted(segments), [0, 1])
                 expected = sum(sum(v) / len(v) for v in segments.values()) / 2
-                self.assertEqual(len(events), 1)
-                self.assertEqual(events[0][0], "R_ref")
-                self.assertAlmostEqual(events[0][1], expected, places=9)
+                r_ref_events = [v for kind, v in events if kind == "R_ref"]
+                self.assertEqual(len(r_ref_events), 1)
+                self.assertAlmostEqual(r_ref_events[0], expected, places=9)
+                # One live-display event per CSV row, with the row just written.
+                samples = [v for kind, v in events if kind == "sample"]
+                self.assertEqual(len(samples), len(rows))
+                self.assertEqual(len(events), len(rows) + 1)
+                self.assertEqual(str(samples[-1]["sample_index"]), rows[-1]["sample_index"])
                 self.assertAlmostEqual(expected, 30.0, delta=0.2)
                 for row in rows[len(rref_rows):]:
                     self.assertAlmostEqual(float(row["R_ref_ohm"]), expected, places=9)
@@ -1456,6 +1462,139 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(smu.base_resistance, first)
         default = recorder.DummySourceMeasureUnit()
         self.assertEqual(default.training_gain, 0.0)
+
+
+class LivePlotTests(RecorderTestBase):
+    """Live graph panel: display only, never disturbs the measurement."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = tk.Tk()
+        self.root.withdraw()
+
+    def tearDown(self):
+        for after_id in self.root.tk.splitlist(self.root.tk.call("after", "info")):
+            self.root.tk.call("after", "cancel", after_id)
+        self.root.destroy()
+        super().tearDown()
+
+    @staticmethod
+    def row(t, phase="heating", probe="0", current=0.1, resistance=30.0, **extra):
+        return dict({"time_s": t, "phase": phase, "probe_active": probe,
+                     "power_W": current * current * resistance, "resistance_ohm": resistance,
+                     "measured_voltage_V": current * resistance, "current_A": current,
+                     "R_ref_ohm": "", "step_index": "2", "step_note": "heat"}, **extra)
+
+    def test_resistance_only_while_current_is_sourced(self):
+        sample = live_plot.sample_from_row
+        self.assertEqual(sample(self.row(1.0))["R"], 30.0)
+        self.assertEqual(sample(self.row(1.0, "cooling", "1", current=1e-3))["R"], 30.0)
+        # True 0 output (e.g. 47.5 -> 0.019 ohm transient): not drawn.
+        self.assertTrue(math.isnan(sample(self.row(1.0, "cooling", "0", current=1.5e-4,
+                                                   resistance=0.019))["R"]))
+        self.assertTrue(math.isnan(sample(self.row(1.0, current=5e-5))["R"]))
+        self.assertEqual(sample(self.row(1.0, R_ref_ohm="31.5"))["R_ref"], 31.5)
+        self.assertIsNone(sample(self.row(1.0))["R_ref"])
+
+    def test_limit_lines_follow_the_mode(self):
+        flat = {"P_max": 1.1, "V_max": 6.0, "I_lim": 0.25, "V_lim": 10.0, "I_max": 0.08}
+        self.assertEqual(live_plot.limit_lines("power", flat),
+                         {"P": (1.1, "P_max"), "V": (6.0, "V_max"), "I": (0.25, "I_lim")})
+        self.assertEqual(live_plot.limit_lines("current", flat),
+                         {"P": (1.1, "P_max"), "V": (10.0, "V_lim"), "I": (0.08, "I_max")})
+        self.assertEqual(live_plot.limit_lines("voltage", None), {})
+
+    def test_window_spans_pause_and_reset(self):
+        plot = live_plot.LivePlot(self.root)
+        plot.reset("power", {"P_max": 1.1, "V_max": 6.0, "I_lim": 0.25}, r_ref=30.0)
+        for i in range(3000):                       # 300 s, heat 8 s / cool 15 s
+            t = i * 0.1
+            heat = t % 23 < 8
+            plot.add_row(self.row(t, "heating" if heat else "cooling", "0" if heat else "1",
+                                  current=0.1 if heat else 1e-3))
+        plot.window.set("최근 1분")
+        first, left, right = plot.visible_range()
+        self.assertAlmostEqual(left, 299.9 - 60, places=6)
+        self.assertGreaterEqual(plot.times[first], left)            # first point inside
+        self.assertLess(plot.times[first - 1], left)
+        self.assertAlmostEqual(right, 299.9, places=6)
+        plot.window.set("전체")
+        self.assertEqual(plot.visible_range()[:2], (0, 0.0))
+        self.assertEqual([s[0] for s in plot.spans[:3]], ["heating", "cooling", "heating"])
+        self.assertAlmostEqual(plot.spans[0][2], 8.0, places=6)    # closed at next phase
+        plot.redraw()
+        self.assertEqual(plot.value_vars["P"].get(), "0.3 W")       # t=299.9 s is heating
+        self.assertEqual(plot.value_vars["I"].get(), "100 mA")
+        limit, label = plot.limit_artists["I"]
+        self.assertTrue(limit.get_visible())
+        self.assertEqual(list(limit.get_ydata()), [250.0, 250.0])   # shown in mA
+        self.assertIn("R_ref 30", plot.limit_artists["R"][1].get_text())
+        self.assertLessEqual(len(plot.lines["P"].get_xdata()), live_plot.MAX_POINTS)
+        x_left, x_right = plot.axes["P"].get_xlim()
+        self.assertAlmostEqual(x_left, 0.0)
+        self.assertAlmostEqual(x_right, 299.9, places=6)
+
+        # Paused: data keeps coming in, the drawing does not change.
+        plot.toggle_pause()
+        count = plot.redraw_count
+        plot.add_row(self.row(300.0))
+        plot._tick()
+        self.assertEqual(plot.redraw_count, count)
+        self.assertEqual(len(plot.times), 3001)
+        self.assertIn("일시정지", plot.state_text.get())
+        plot.toggle_pause()
+        plot._tick()
+        self.assertEqual(plot.redraw_count, count + 1)
+
+        plot.reset("voltage", {"V_max": 12.0})
+        plot.redraw()
+        self.assertEqual((plot.times, plot.spans, plot.r_ref), ([], [], None))
+        self.assertFalse(plot.limit_artists["I"][0].get_visible())
+        self.assertEqual(plot.value_vars["P"].get(), "—")
+        plot.close()
+
+    def test_display_callback_failure_never_stops_the_measurement(self):
+        calls = []
+
+        def broken(kind, value):
+            calls.append(kind)
+            raise RuntimeError("display bug")
+        smu, rows, error = self.run_mode("voltage", [(1.0, 0.3), (0.0, 0.2)],
+                                         VOLTAGE_LIMITS, on_event=broken)
+        self.assertIsNone(error)
+        self.assertGreater(len(rows), 5)
+        self.assertEqual(calls, ["sample"])          # reported once, then not called again
+        self.assertFalse(smu._output_enabled)
+
+    def test_gui_run_feeds_the_graph(self):
+        temp = Path(self.temp.name)
+        gui = main_gui.ExperimentGUI(self.root, profile_dir=temp / "p",
+                                     settings_path=temp / "s.json")
+        gui.clear_rows()
+        with patch.object(gui, "ask_mode_change", return_value="clear"):
+            gui.set_mode("power")
+        gui.limit_vars["power"]["P_max"].set("1.1")
+        gui.add_row(0.3, 0.3, "heat")
+        gui.add_row(0, 0.3, "cool")
+        for key, value in {"sample": "5", "cycle": "1", "directory": self.temp.name,
+                           "SAMPLE_INTERVAL_S": "0.02"}.items():
+            gui.variables[key].set(value)
+        gui.dummy.set(True)
+        gui.live_plot.add_row(self.row(1.0))         # stale data from a previous run
+        with patch("threading.Thread") as thread:
+            gui.start()                                # reset only; run the worker below
+        self.assertEqual(gui.live_plot.times, [])
+        self.assertEqual(gui.live_plot.limits["P"], (1.1, "P_max"))
+        settings, path, dummy = thread.call_args.kwargs["args"]
+        gui.worker(settings, path, dummy)
+        gui.poll()
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(len(gui.live_plot.times), len(rows))
+        self.assertEqual([s[0] for s in gui.live_plot.spans], ["heating", "cooling"])
+        gui.live_plot.redraw()
+        self.assertNotEqual(gui.live_plot.value_vars["P"].get(), "—")
+        self.assertFalse(gui.running)
 
 
 if __name__ == "__main__":

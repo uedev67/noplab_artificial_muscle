@@ -15,6 +15,7 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 import control_modes
+import live_plot
 import manual_voltage_profile as recorder
 import profile_builder
 import profile_store
@@ -602,7 +603,7 @@ class ExperimentGUI:
     def __init__(self, root, profile_dir=None, settings_path=None):
         self.root = root
         root.title("Keithley 2450 · 제어 프로파일 측정")
-        root.geometry("1180x940")
+        root.geometry("1800x960")   # main() maximizes the window
         root.minsize(900, 700)
         self.profile_dir = Path(profile_dir or profile_store.PROFILE_DIR)
         self.settings_path = Path(settings_path or profile_store.SETTINGS_PATH)
@@ -621,7 +622,15 @@ class ExperimentGUI:
         self._suspend_dirty = True
         self.profile_list = None
 
-        notebook = ttk.Notebook(root)
+        # Left: experiment UI.  Right: live graph (display only).
+        panes = ttk.PanedWindow(root, orient="horizontal")
+        panes.pack(fill="both", expand=True)
+        left = ttk.Frame(panes)
+        panes.add(left, weight=3)
+        self.live_plot = live_plot.LivePlot(panes)
+        panes.add(self.live_plot.frame, weight=2)
+
+        notebook = ttk.Notebook(left)
         notebook.pack(fill="both", expand=True, padx=12, pady=10)
         basic = ttk.Frame(notebook, padding=12)
         advanced = ttk.Frame(notebook, padding=12)
@@ -767,7 +776,7 @@ class ExperimentGUI:
         for row, (label, key) in enumerate(metadata, first + 2):
             self.field(advanced, row, label, key, getattr(recorder, key))
 
-        controls = ttk.Frame(root, padding=(12, 0))
+        controls = ttk.Frame(left, padding=(12, 0))
         controls.pack(fill="x")
         self.start_button = ttk.Button(controls, text="시작 (키슬리 실행)", command=self.start)
         self.start_button.pack(side="left")
@@ -775,7 +784,7 @@ class ExperimentGUI:
         self.stop_button.pack(side="left", padx=8)
         self.status = tk.StringVar(value="대기 중 · 시작 버튼을 누르면 장비에 연결합니다.")
         ttk.Label(controls, textvariable=self.status).pack(side="left")
-        self.log = ScrolledText(root, height=8, state="disabled", wrap="word")
+        self.log = ScrolledText(left, height=8, state="disabled", wrap="word")
         self.log.pack(fill="both", padx=12, pady=10)
 
         self.restore_last_settings()
@@ -1454,6 +1463,8 @@ class ExperimentGUI:
         self.save_last_settings()
         self.measured_r_ref = None
         self.update_r_ref_status()
+        self.live_plot.reset(settings["CONTROL_MODE"], settings["SAFETY_LIMITS"],
+                             settings["MANUAL_R_REF"])
         self.stop_event.clear()
         self.set_running(True)
         self.status.set(("더미 측정 중" if dummy else "장비 연결 / 측정 중") + f" · {MODES[self.mode].label}")
@@ -1488,6 +1499,8 @@ class ExperimentGUI:
         """Called from the worker thread; the Tk side reads it in poll()."""
         if kind == "R_ref":
             self.messages.put(("rref", value))
+        elif kind == "sample":
+            self.messages.put(("sample", value))
 
     def stop(self):
         self.stop_event.set()
@@ -1499,6 +1512,7 @@ class ExperimentGUI:
             self.closing = True
             self.stop()
         else:
+            self.live_plot.close()
             self.root.destroy()
 
     def poll(self):
@@ -1507,9 +1521,16 @@ class ExperimentGUI:
                 kind, text = self.messages.get_nowait()
             except queue.Empty:
                 break
+            if kind == "sample":
+                try:
+                    self.live_plot.add_row(text)
+                except Exception:   # display only: never disturb the run
+                    pass
+                continue
             if kind == "rref":
                 self.measured_r_ref = text
                 self.update_r_ref_status(text)
+                self.live_plot.set_r_ref(text)
                 self.status.set(self.status.get().split(" · R_ref")[0] + f" · R_ref {text:.6g} Ω")
                 continue
             self.log.configure(state="normal")
@@ -1528,14 +1549,27 @@ class ExperimentGUI:
                     messagebox.showerror("안전 종료" if kind == "safety" else "측정 오류", text,
                                          parent=self.root)
                 if self.closing:
+                    self.live_plot.close()
                     self.root.destroy()
                     return
         self.root.after(100, self.poll)
 
 
+def maximize(root):
+    """Open maximized (full monitor, taskbar still visible)."""
+    try:
+        root.state("zoomed")              # Windows
+    except tk.TclError:
+        try:
+            root.attributes("-zoomed", True)   # X11
+        except tk.TclError:
+            pass
+
+
 def main():
     root = tk.Tk()
     ExperimentGUI(root)
+    maximize(root)
     root.mainloop()
 
 
