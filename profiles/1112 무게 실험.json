@@ -1,0 +1,84 @@
+{
+  "format_version": 2,
+  "name": "1112 무게 실험",
+  "mode": "current",
+  "value_unit": "A",
+  "steps": [
+    {
+      "value": 0.0,
+      "duration_s": 5.0,
+      "note": "waiting"
+    },
+    {
+      "value": 0.001,
+      "duration_s": 60.0,
+      "note": "1g weight"
+    },
+    {
+      "value": 0.001,
+      "duration_s": 12.0,
+      "note": "change weight"
+    },
+    {
+      "value": 0.001,
+      "duration_s": 60.0,
+      "note": "2.3g weight"
+    },
+    {
+      "value": 0.001,
+      "duration_s": 12.0,
+      "note": "change weight"
+    },
+    {
+      "value": 0.001,
+      "duration_s": 60.0,
+      "note": "4.3 weight"
+    },
+    {
+      "value": 0.001,
+      "duration_s": 12.0,
+      "note": "change weight"
+    },
+    {
+      "value": 0.001,
+      "duration_s": 60.0,
+      "note": "2.3g weight"
+    },
+    {
+      "value": 0.001,
+      "duration_s": 12.0,
+      "note": "change weight"
+    },
+    {
+      "value": 0.001,
+      "duration_s": 60.0,
+      "note": "1g weight"
+    }
+  ],
+  "limits": {
+    "current": {
+      "V_lim": 1.0,
+      "I_max": 0.08,
+      "P_max": 0.3
+    },
+    "common": {
+      "R_jump_pct": 100.0
+    }
+  },
+  "probe": {
+    "enabled": false,
+    "I_probe_A": 0.001,
+    "V_probe_max_V": 0.2,
+    "R_jump_skip_samples": 2
+  },
+  "R_ref": {
+    "manual_ohm": null
+  },
+  "cooling": {
+    "timeout_abort": false,
+    "timeout_abort_count": 2
+  },
+  "description": "1112 무게 실험",
+  "created_at": "2026-11-12T10:21:34+09:00",
+  "updated_at": "2026-11-12T10:21:34+09:00"
+}

@@ -91,7 +91,7 @@ DEFAULT_LIMITS = {
     "voltage": {"I_lim": 0.16, "V_max": 12.0, "P_max": 1.5},
     "current": {"V_lim": 12.0, "I_max": 0.16, "P_max": 1.5},
     "power": {"I_lim": 0.16, "P_max": 1.5, "V_max": 12.0},
-    "common": {"R_jump_pct": 5.0},
+    "common": {"R_jump_pct": 100.0},
     "power_control": {"probe_V": 0.1, "max_step_V": 1.0, "max_R_failures": 3},
 }
 

@@ -1597,5 +1597,53 @@ class LivePlotTests(RecorderTestBase):
         self.assertFalse(gui.running)
 
 
+class RunProgressTest(unittest.TestCase):
+    PROFILE = [(0.0, 10.0, 1, "idle", {}), (1.0, 20.0, 1, "heat", {}),
+               (0.0, 40.0, 1, "cool", {"end": {"type": "rref", "t_min_s": 10.0}})]
+
+    def test_totals_use_t_min_and_t_max_of_conditional_steps(self):
+        progress = main_gui.RunProgress.from_profile(self.PROFILE)
+        self.assertEqual((progress.total_min, progress.total_max), (40.0, 70.0))
+        self.assertEqual(progress.estimate(), (0.0, 40.0, 70.0, 0.0))
+
+    def test_estimate_extrapolates_but_stops_at_step_maximum(self):
+        progress = main_gui.RunProgress.from_profile(self.PROFILE)
+        progress.update({"step_index": "2", "time_s": "15", "step_elapsed_s": "5"}, now=100.0)
+        self.assertEqual(progress.estimate(100.0)[:3], (15.0, 25.0, 55.0))
+        self.assertEqual(progress.estimate(102.0)[:3], (17.0, 23.0, 53.0))
+        # Step 2 lasts at most 20 s: no extrapolation beyond its end.
+        elapsed, _, remaining_max, fraction = progress.estimate(200.0)
+        self.assertEqual((elapsed, remaining_max), (30.0, 40.0))
+        self.assertAlmostEqual(fraction, 30.0 / 70.0)
+
+    def test_early_conditional_end_shrinks_the_total(self):
+        progress = main_gui.RunProgress.from_profile(self.PROFILE)
+        progress.update({"step_index": "3", "time_s": "42", "step_elapsed_s": "12"}, now=0.0)
+        elapsed, remaining_min, remaining_max, _ = progress.estimate()
+        self.assertEqual((elapsed, remaining_min, remaining_max), (42.0, 0.0, 28.0))
+
+    def test_current_step_memo_and_phase(self):
+        progress = main_gui.RunProgress.from_profile(self.PROFILE)
+        self.assertEqual(progress.notes, ["idle", "heat", "cool"])
+        progress.update({"step_index": "2", "time_s": "15", "step_elapsed_s": "5",
+                         "phase": "heating", "step_note": "heat"}, now=0.0)
+        self.assertEqual((progress.note, progress.phase), ("heat", "heating"))
+        # No step_note column: fall back to the planned memo of that step.
+        progress.update({"step_index": "3", "time_s": "31", "step_elapsed_s": "1",
+                         "phase": "cooling"}, now=1.0)
+        self.assertEqual((progress.note, progress.phase), ("cool", "cooling"))
+
+    def test_bad_rows_are_ignored(self):
+        progress = main_gui.RunProgress.from_profile(self.PROFILE)
+        for row in ({}, {"step_index": "9", "time_s": "1", "step_elapsed_s": "1"},
+                    {"step_index": "1", "time_s": "nan", "step_elapsed_s": "1"}):
+            progress.update(row, now=0.0)
+        self.assertIsNone(progress.clock)
+
+    def test_format_clock(self):
+        self.assertEqual(main_gui.format_clock(240), "4:00")
+        self.assertEqual(main_gui.format_clock(3725.9), "1:02:05")
+
+
 if __name__ == "__main__":
     unittest.main()
