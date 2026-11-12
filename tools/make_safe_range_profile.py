@@ -127,7 +127,7 @@ def parse_args(argv=None):
     p.add_argument("--i-lim", type=float, default=0.25, help="전류 제한 I_lim (A)")
     p.add_argument("--v-max", type=float, default=6.0, help="명령 전압 상한 V_max (V)")
     p.add_argument("--p-max", type=float, default=1.1, help="목표 전력 상한 P_max (W)")
-    p.add_argument("--r-jump-pct", type=float, default=10.0, help="R 급변 기준 (%%)")
+    p.add_argument("--r-jump-pct", type=float, default=100.0, help="R 급변 기준 (%%)")
     p.add_argument("--probe-v", type=float, default=d_ctrl["probe_V"], help="탐침 전압 (V)")
     p.add_argument("--max-step-v", type=float, default=d_ctrl["max_step_V"],
                    help="샘플당 최대 전압 증가 (V)")

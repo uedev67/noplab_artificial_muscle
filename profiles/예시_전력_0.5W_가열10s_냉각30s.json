@@ -47,7 +47,7 @@
       "V_max": 12.0
     },
     "common": {
-      "R_jump_pct": 5.0
+      "R_jump_pct": 100.0
     },
     "power_control": {
       "probe_V": 0.1,

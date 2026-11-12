@@ -131,9 +131,9 @@ RESOURCE_NAME = "USB0::0x05E6::0x2450::04495764::INSTR"
 # SAFETY_LIMITS: software limits checked before start and on every sample.
 #   None keeps the original CLI behaviour (voltage mode only; hardware
 #   compliance only).  Power / current mode always require a dict, e.g.
-#       voltage: {"V_max": 12, "P_max": 1.5, "R_jump_pct": 5}
-#       current: {"I_max": 0.16, "P_max": 1.5, "R_jump_pct": 5}
-#       power  : {"P_max": 1.5, "V_max": 12, "R_jump_pct": 5,
+#       voltage: {"V_max": 12, "P_max": 1.5, "R_jump_pct": 100}
+#       current: {"I_max": 0.16, "P_max": 1.5, "R_jump_pct": 100}
+#       power  : {"P_max": 1.5, "V_max": 12, "R_jump_pct": 100,
 #                 "probe_V": 0.1, "max_step_V": 1.0, "max_R_failures": 3}
 # ---------------------------------------------------------------------------
 
