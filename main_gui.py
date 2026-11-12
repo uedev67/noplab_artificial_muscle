@@ -6,6 +6,7 @@ import math
 import queue
 import re
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from contextlib import redirect_stdout
@@ -62,6 +63,89 @@ def format_duration(seconds: float) -> str:
     if seconds >= 60:
         return f"{int(seconds // 60)}분 {seconds % 60:g}초"
     return f"{seconds:g}초"
+
+
+def format_clock(seconds: float) -> str:
+    """1:05 / 1:02:03 style clock text (whole seconds)."""
+    seconds = max(0, int(seconds + 1e-6))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+class RunProgress:
+    """Elapsed / remaining time of a run, from the planned step durations.
+
+    *plan* is [(min_s, max_s)] per step.  min < max for a conditional cooling
+    step (it may end anywhere between t_min and t_max).  update() takes each
+    live sample row; estimate() extrapolates from the last sample with the
+    local clock so the gauge also moves between samples.  Within a step the
+    extrapolation never runs past the step's planned maximum.
+    """
+
+    def __init__(self, plan, notes=None):
+        self.plan = [(float(low), float(high)) for low, high in plan]
+        self.notes = list(notes) if notes is not None else [""] * len(self.plan)
+        self.note = ""         # memo of the current step
+        self.phase = ""        # heating / cooling / rref / idle of the last sample
+        # after_min[k] / after_max[k]: planned time of steps k+1.. (k = 1-based step)
+        self.after_min = [0.0] * (len(self.plan) + 1)
+        self.after_max = [0.0] * (len(self.plan) + 1)
+        for k in range(len(self.plan) - 1, -1, -1):
+            self.after_min[k] = self.after_min[k + 1] + self.plan[k][0]
+            self.after_max[k] = self.after_max[k + 1] + self.plan[k][1]
+        self.step = 0          # 1-based current step, 0 = no sample yet
+        self.time_s = 0.0      # time_s of the last sample
+        self.step_elapsed = 0.0
+        self.clock = None      # local monotonic time of the last sample
+
+    @classmethod
+    def from_profile(cls, profile):
+        """From settings["PROFILE"] entries (value, duration, cycle, note, options)."""
+        plan, notes = [], []
+        for entry in profile:
+            duration = float(entry[1])
+            options = entry[4] if len(entry) > 4 and entry[4] else {}
+            end = options.get("end")
+            plan.append((min(float(end["t_min_s"]), duration) if end else duration, duration))
+            notes.append(str(entry[3]) if len(entry) > 3 and entry[3] is not None else "")
+        return cls(plan, notes)
+
+    @property
+    def total_min(self):
+        return self.after_min[0]
+
+    @property
+    def total_max(self):
+        return self.after_max[0]
+
+    def update(self, row, now):
+        try:
+            step = int(float(row["step_index"]))
+            time_s = float(row["time_s"])
+            step_elapsed = float(row["step_elapsed_s"])
+        except (KeyError, TypeError, ValueError):
+            return
+        if not 1 <= step <= len(self.plan) or not (math.isfinite(time_s)
+                                                    and math.isfinite(step_elapsed)):
+            return
+        self.step, self.time_s, self.step_elapsed, self.clock = step, time_s, step_elapsed, now
+        self.note = str(row.get("step_note") or self.notes[step - 1]).strip()
+        self.phase = str(row.get("phase") or "")
+
+    def estimate(self, now=None):
+        """(elapsed_s, remaining_min_s, remaining_max_s, fraction 0..1)."""
+        if self.clock is None:
+            return 0.0, self.total_min, self.total_max, 0.0
+        low, high = self.plan[self.step - 1]
+        extra = 0.0 if now is None else max(0.0, now - self.clock)
+        step_elapsed = max(self.step_elapsed, min(self.step_elapsed + extra, high))
+        elapsed = self.time_s + (step_elapsed - self.step_elapsed)
+        remaining_min = max(0.0, low - step_elapsed) + self.after_min[self.step]
+        remaining_max = max(0.0, high - step_elapsed) + self.after_max[self.step]
+        total = elapsed + remaining_max
+        fraction = min(1.0, elapsed / total) if total > 0 else 1.0
+        return elapsed, remaining_min, remaining_max, fraction
 
 
 SECTION_BORDER = "#8b9bb4"   # section frame border
@@ -829,6 +913,7 @@ class ExperimentGUI:
         self.stop_button.pack(side="left", padx=8)
         self.status = tk.StringVar(value="대기 중 · 시작 버튼을 누르면 장비에 연결합니다.")
         ttk.Label(controls, textvariable=self.status).pack(side="left")
+        self.build_progress_panel(run_frame)
         self.log = ScrolledText(run_frame, height=8, state="disabled", wrap="word")
         self.log.pack(fill="both", pady=(6, 0))
 
@@ -853,6 +938,120 @@ class ExperimentGUI:
             widget = ttk.Entry(parent, textvariable=variable)
         widget.grid(row=row, column=1, sticky="ew", pady=3)
         self.editors.append(widget)
+
+    PROGRESS_COLORS = {"run": "#86b6f2", "done": "#7fd19b", "stopped": "#f3c27a",
+                       "error": "#ee9090"}
+    # Step badge colour per phase (same hues as the live graph shading, a bit stronger).
+    STEP_BADGE = {"heating": ("#f2b8ad", "가열"), "cooling": ("#a9c9ee", "냉각"),
+                  "rref": ("#c9b6e8", "R_ref 측정"), "idle": ("#dde3ea", "대기")}
+
+    def build_progress_panel(self, parent):
+        """Run progress gauge: % done, elapsed / planned time, time left, step memo."""
+        frame = ttk.Frame(parent)
+        frame.pack(fill="x", pady=(8, 0))
+        self.progress = None            # RunProgress of the current / last run
+        self.progress_job = None
+        self.progress_state = ("idle", 0.0, "")
+        self.progress_canvas = tk.Canvas(frame, height=28, highlightthickness=1,
+                                         highlightbackground=SECTION_BORDER, background="#e6ebf2")
+        self.progress_canvas.pack(fill="x")
+        self.progress_canvas.bind("<Configure>", lambda _: self.draw_progress())
+
+        # Current step: coloured badge (step number + phase) and the memo in large bold text.
+        step_bar = ttk.Frame(frame)
+        step_bar.pack(fill="x", pady=(6, 0))
+        size = self.bold_font.cget("size")
+        self.memo_font = self.bold_font.copy()
+        self.memo_font.configure(size=size + 4 if size > 0 else size - 5)
+        self.step_badge = tk.Label(step_bar, text="단계 —", font=self.bold_font, padx=8, pady=2,
+                                   background=self.STEP_BADGE["idle"][0], foreground="#10233f")
+        self.step_badge.pack(side="left")
+        self.step_memo = tk.Label(step_bar, text="대기 중", font=self.memo_font,
+                                  foreground="#7a8699", anchor="w")
+        self.step_memo.pack(side="left", fill="x", expand=True, padx=(10, 0))
+
+        self.progress_text = tk.StringVar(value="시작하면 진행률과 남은 시간이 표시됩니다.")
+        ttk.Label(frame, textvariable=self.progress_text).pack(anchor="w", pady=(4, 0))
+        self.draw_progress()
+
+    def show_step(self, step_text, phase="idle", memo="", placeholder="메모 없음"):
+        """Badge 'step k/N · phase' + the step memo (grey placeholder if empty)."""
+        colour, phase_label = self.STEP_BADGE.get(phase, self.STEP_BADGE["idle"])
+        self.step_badge.configure(text=f"{step_text} · {phase_label}" if phase in self.STEP_BADGE
+                                  else step_text, background=colour)
+        self.step_memo.configure(text=memo or placeholder,
+                                 foreground=SECTION_TITLE if memo else "#7a8699")
+
+    def draw_progress(self):
+        state, fraction, label = self.progress_state
+        canvas = self.progress_canvas
+        canvas.delete("all")
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if fraction > 0:
+            canvas.create_rectangle(0, 0, max(1, width * fraction), height, width=0,
+                                    fill=self.PROGRESS_COLORS.get(state, "#86b6f2"))
+        canvas.create_text(width / 2, height / 2, text=label, font=self.bold_font,
+                           fill="#10233f")
+
+    def set_progress(self, state, fraction, label, detail):
+        self.progress_state = (state, max(0.0, min(1.0, fraction)), label)
+        self.progress_text.set(detail)
+        self.draw_progress()
+
+    def start_progress(self, profile):
+        self.progress = RunProgress.from_profile(profile)
+        total = self.progress.total_max
+        planned = format_clock(total) if self.progress.total_min == total else \
+            f"{format_clock(self.progress.total_min)}~{format_clock(total)}"
+        self.progress_planned = planned
+        self.set_progress("run", 0.0, f"0.0 %  ·  0:00 / {planned}",
+                          f"장비 연결 중 · 예정 총 시간 {planned}")
+        self.show_step(f"단계 0/{len(self.progress.plan)}", "none", placeholder="장비 연결 중")
+        self.tick_progress()
+
+    def tick_progress(self):
+        self.progress_job = None
+        if self.progress is None or not self.running:
+            return
+        self.show_progress(time.monotonic())
+        self.progress_job = self.root.after(250, self.tick_progress)
+
+    def show_progress(self, now=None, state="run", prefix=""):
+        progress = self.progress
+        if progress.clock is None:
+            if state != "run":
+                self.set_progress(state, 0.0, prefix.strip(" ·") or "0.0 %",
+                                  f"{prefix}측정 데이터 없음 · 예정 총 시간 {self.progress_planned}")
+                self.show_step(f"{prefix}단계 0/{len(progress.plan)}", "none",
+                               placeholder="측정 데이터 없음")
+            return
+        elapsed, remaining_min, remaining_max, fraction = progress.estimate(now)
+        if state == "done":
+            fraction, remaining_min, remaining_max = 1.0, 0.0, 0.0
+        total = elapsed + remaining_max
+        # Remaining time rounds up so that elapsed + remaining = total on screen.
+        low, high = (format_clock(math.ceil(value - 1e-6)) for value in (remaining_min, remaining_max))
+        remaining = high if low == high else f"{low}~{high} (조건부 냉각에 따라 달라짐)"
+        self.set_progress(
+            state, fraction,
+            f"{prefix}{fraction * 100:.1f} %  ·  {format_clock(elapsed)} / {format_clock(total)}",
+            f"{prefix}경과 {format_clock(elapsed)} · 남은 시간 {remaining} · "
+            f"예정 총 시간 {self.progress_planned}")
+        self.show_step(f"{prefix}단계 {progress.step}/{len(progress.plan)}",
+                       progress.phase, progress.note)
+
+    def finish_progress(self, kind):
+        if self.progress_job is not None:
+            self.root.after_cancel(self.progress_job)
+            self.progress_job = None
+        if self.progress is None:
+            return
+        if kind == "done" and not self.stop_event.is_set():
+            self.show_progress(state="done", prefix="완료 · ")
+        elif kind == "done":
+            self.show_progress(state="stopped", prefix="중지됨 · ")
+        else:
+            self.show_progress(state="error", prefix="안전 종료 · " if kind == "safety" else "오류 · ")
 
     def build_safety_panel(self, parent):
         self.safety_frame = ttk.LabelFrame(parent, text="안전 상한", padding=8)
@@ -1512,6 +1711,7 @@ class ExperimentGUI:
                              settings["MANUAL_R_REF"])
         self.stop_event.clear()
         self.set_running(True)
+        self.start_progress(settings["PROFILE"])
         self.status.set(("더미 측정 중" if dummy else "장비 연결 / 측정 중") + f" · {MODES[self.mode].label}")
         threading.Thread(target=self.worker, args=(settings, path, dummy), daemon=False).start()
 
@@ -1567,6 +1767,8 @@ class ExperimentGUI:
             except queue.Empty:
                 break
             if kind == "sample":
+                if self.progress is not None:
+                    self.progress.update(text, time.monotonic())
                 try:
                     self.live_plot.add_row(text)
                 except Exception:   # display only: never disturb the run
@@ -1586,6 +1788,7 @@ class ExperimentGUI:
             self.log.configure(state="disabled")
             if kind != "log":
                 self.set_running(False)
+                self.finish_progress(kind)
                 status = text.splitlines()[0]
                 if self.measured_r_ref is not None:
                     status += f" · R_ref {self.measured_r_ref:.6g} Ω (측정)"
